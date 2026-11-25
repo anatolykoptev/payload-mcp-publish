@@ -1,0 +1,4 @@
+payload-mcp-publish
+Copyright 2026 Anatoly Koptev
+
+This product is a plugin for Payload (MIT) and uses zod (MIT) as a peer dependency.
