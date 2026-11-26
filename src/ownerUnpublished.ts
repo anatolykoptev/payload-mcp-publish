@@ -2,34 +2,20 @@ import type { CollectionSlug, Payload, PayloadRequest } from 'payload'
 import { NotFound } from 'payload'
 
 /**
- * Has the owner taken a document down? Payload answers this nowhere: a never-published document and an unpublished one
- * both have a draft live row. The only evidence is the version history, and that is pruned (`versions.maxPerDoc`,
- * oldest first, whatever their status), so an agent saving drafts before or after the owner's unpublish can push the
- * published version out.
+ * Has the owner taken a document down? Payload keeps no record: a never-published and an unpublished document both have
+ * a draft live row, and the only evidence is the version history. A document whose live row is not published is
+ * - `retired` when a published version is in its history;
+ * - `never` otherwise.
  *
- * The lane therefore fails closed. A document whose live row is not published is
- * - `retired` when a published version is still in its history;
- * - `never` only when the history provably holds every version the document ever had: fewer than `maxPerDoc` of them
- *   (Payload prunes only past the limit), or `maxPerDoc: 0` (keep all). No timestamp is trusted: Payload's own first
- *   version differs from its document's by a millisecond or none;
- * - `pruned` otherwise: it may have been published once. The lane refuses to publish it and to edit it over MCP; the
- *   owner publishes or edits it in the admin. A draft that has been saved `maxPerDoc` times lands here too.
+ * The history is pruned (`versions.maxPerDoc`, oldest first), and once it has lost the published version the guard cannot
+ * tell. Retired documents are best deleted: delete what you retire. Until then the lane refuses every MCP update of a
+ * `retired` document, so an agent cannot push the evidence out by saving drafts.
  */
-export type Standing = 'live' | 'never' | 'pruned' | 'retired'
+export type Standing = 'live' | 'never' | 'retired'
 
-/** Payload keeps 100 versions per document unless told otherwise; 0 keeps all. */
-const DEFAULT_MAX_PER_DOC = 100
 type Version = { published: boolean }
 
-const maxPerDoc = (payload: Payload, collection: string): number => {
-  const versions = payload.collections[collection as CollectionSlug]?.config.versions
-  return typeof versions === 'object' && versions ? (versions.maxPerDoc ?? DEFAULT_MAX_PER_DOC) : DEFAULT_MAX_PER_DOC
-}
-
-const judge = (versions: Version[], max: number): Exclude<Standing, 'live'> => {
-  if (versions.some((v) => v.published)) return 'retired'
-  return max === 0 || versions.length < max ? 'never' : 'pruned'
-}
+const judge = (versions: Version[]): Exclude<Standing, 'live'> => (versions.some((v) => v.published) ? 'retired' : 'never')
 
 const SELECT = { parent: true, version: { _status: true } } as const
 
@@ -69,11 +55,11 @@ export const standingOf = async (
     where: { parent: { equals: id } },
     ...(req ? { req } : {}),
   })
-  return judge(docs.map(toVersion), maxPerDoc(payload, collection))
+  return judge(docs.map(toVersion))
 }
 
 /**
- * Ids of the documents of a collection that the lane must treat as taken down: `retired` or `pruned` (see `Standing`).
+ * Ids of the documents of a collection that the owner took down (`retired`, see `Standing`).
  * One query for the drafts and one for their versions.
  */
 export const ownerUnpublishedIds = async (payload: Payload, collection: CollectionSlug): Promise<(number | string)[]> => {
@@ -102,6 +88,5 @@ export const ownerUnpublishedIds = async (payload: Payload, collection: Collecti
     const v = toVersion(raw)
     byParent.set(v.parent, [...(byParent.get(v.parent) ?? []), v])
   }
-  const max = maxPerDoc(payload, collection)
-  return drafts.docs.filter((d) => judge(byParent.get(d.id) ?? [], max) !== 'never').map((d) => d.id)
+  return drafts.docs.filter((d) => judge(byParent.get(d.id) ?? []) !== 'never').map((d) => d.id)
 }

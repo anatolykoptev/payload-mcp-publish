@@ -11,7 +11,7 @@ import { standingOf } from './ownerUnpublished.js'
  *    pin (the admin, scripts) it does nothing.
  * 2. An MCP request never publishes: a create or update whose data says `_status: 'published'` is refused here, whatever
  *    the site's draft-only hook did or did not do. `publishDraft` is the only way, and it runs without the MCP request.
- * 3. An MCP request may not update a document the owner took down, or one whose history is too pruned to tell (see
+ * 3. An MCP request may not update a document the owner took down (see
  *    `standingOf`): saving drafts on it would push the evidence out of the version history.
  */
 export const publishPin: CollectionBeforeChangeHook = async ({ collection, context, data, operation, originalDoc, req }) => {
@@ -28,11 +28,9 @@ export const publishPin: CollectionBeforeChangeHook = async ({ collection, conte
   }
   if (operation === 'update' && originalDoc && originalDoc._status !== 'published') {
     const standing = await standingOf(req.payload, collection.slug as never, originalDoc.id as number | string, req)
-    if (standing === 'retired' || standing === 'pruned') {
+    if (standing === 'retired') {
       throw new APIError(
-        standing === 'retired'
-          ? `${collection.slug} #${String(originalDoc.id)} was unpublished by the owner; it cannot be edited from here. Republish or edit it in the admin.`
-          : `${collection.slug} #${String(originalDoc.id)} has a pruned version history, so it cannot be told apart from one the owner unpublished; it cannot be edited from here. Edit or publish it in the admin.`,
+        `${collection.slug} #${String(originalDoc.id)} was unpublished by the owner; it cannot be edited from here. Republish or edit it in the admin.`,
         409,
         undefined,
         true,

@@ -18,16 +18,12 @@ No code change, no deploy.
 - **The key's own scope.** The tool is unticked on every key (the plugin registers custom tools ticked), and a key also needs
   its own `update` box for the collection: the tool never widens a key.
 - **A collection allowlist.** Only the collections you list can publish from here.
-- **What the owner took down stays down, and what cannot be told stays out.** Payload keeps no record that the owner
-  unpublished a document: a never-published and an unpublished document both have a draft live row, and the only evidence is
-  the version history, which is pruned (`versions.maxPerDoc`, oldest first, whatever their status). The lane fails closed. A
-  document whose live row is not published is publishable from here only when a published version is absent **and** the
-  history provably holds every version it ever had (fewer than `maxPerDoc`, or `maxPerDoc: 0`). If a published version is in
-  the history it is `retired`; if the history is full it is `pruned` and cannot be told apart. Both are refused by
-  `publishDraft`, **refused for every MCP update** (so an agent cannot push the evidence out by saving drafts), and hidden
-  from MCP reads with `hideOwnerUnpublishedFromMcp`. The owner edits or publishes them in the admin. The cost: a new draft
-  saved `maxPerDoc` times over MCP is locked out the same way, so set `maxPerDoc` well above how often a draft is saved
-  before it first goes live.
+- **What the owner took down stays down.** Payload keeps no record that the owner unpublished a document: a never-published
+  and an unpublished document both have a draft live row, and the only evidence is the version history. A document whose live
+  row is not published and that has a published version in its history is `retired`: `publishDraft` refuses it, **every MCP
+  update of it is refused** (so an agent cannot push the evidence out by saving drafts), and `hideOwnerUnpublishedFromMcp`
+  hides it from MCP reads. The owner republishes or edits it in the admin. The history is pruned (`versions.maxPerDoc`), and
+  once it has lost the published version the guard cannot tell: **retired documents are best deleted. Delete what you retire.**
 - **An MCP write never publishes.** `publishPin` refuses any MCP create or update whose data says `_status: 'published'`,
   whatever the site's draft-only hook does, so the stock update tool is not a second publish path.
 - **A half-wired lane refuses.** Each call checks that the collection has drafts and carries `lane.publishPin`, and refuses

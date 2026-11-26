@@ -93,17 +93,13 @@ export const makePublishDraft = (o: PublishToolOptions) => async (args: Record<s
 
   if (latest._status === 'published') return refuse(`${name} has no pending draft: the live version is the latest.`)
 
-  // Only a draft on top of a live version, or a document provably never published, may go live. A live row that is a
-  // draft with a published version in its history is one the owner took down; one whose history is pruned cannot be told.
+  // Only a draft on top of a live version, or a document never published, may go live. A live row that is a
+  // draft with a published version in its history is one the owner took down.
   const liveRow = await read(false)
   const live = liveRow?._status === 'published' ? liveRow : undefined
   if (!live) {
     const standing = await standingOf(payload, slug, id)
     if (standing === 'retired') return refuse(`${name} was unpublished by the owner; republish in the admin.`)
-    if (standing === 'pruned')
-      return refuse(
-        `${name} has a pruned version history, so it cannot be told apart from one the owner unpublished; publish it in the admin.`,
-      )
   }
 
   const verdict = await o.gate?.check({ args, collection, draft: latest, live, req })

@@ -5,7 +5,7 @@ const CACHE = 'mcpPublishRetired'
 
 /**
  * Read access for a collection whose retired documents an MCP key must not see. An MCP key reads the latest drafts (it
- * writes them), but not a document the owner took down (or whose history is too pruned to tell): that row is a retired
+ * writes them), but not a document the owner took down: that row is a retired
  * claim, and listing it beside the real ones invites an agent to describe or relink it. Everyone else gets `base`
  * unchanged. Wrap the collection's own `read` with it. The ids are looked up once per request.
  */

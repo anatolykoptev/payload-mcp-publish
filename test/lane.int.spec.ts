@@ -26,14 +26,12 @@ import makeConfig from './fixtures/config.js'
  * - src/pin.ts the `pin` comparison: "the update itself refuses a draft that moved after the check".
  * - src/pin.ts the MCP-update guard: "an MCP update of a document the owner took down is refused" and "the
  *   owner-unpublished guard survives a pruned version history" (the version history is pruned).
- * - src/tool.ts the `everPublished` refusal: "is not republished from here".
+ * - src/tool.ts the `standing === .retired.` refusal: "is not republished from here".
  * - src/lane.ts `'publishDraft'` out of the off-by-default names: "a key without the box ticked has no publishDraft".
  * - src/tool.ts the catch made a catch-all (`return null` for every error): "only a missing document is not found".
  * - src/diff.ts `diffSummary` cutting text at 400 characters, or counting array rows: the "full text" cases.
  * - src/diff.ts the "identical" branch: "a change only in formatting or links is still shown"; `PLAIN` listing `block`/`upload`:
  *   "shows what a block node carries".
- * - src/ownerUnpublished.ts `judge` returning `never` for a full history (`versions.length < max` -> `true`): "saves before the owner
- *   unpublishes cannot prune the evidence away" and "a draft saved maxPerDoc times is refused, not guessed".
  * - src/wiring.ts the `publishPin` check, the `drafts` check, the localization check: "refuses a listed collection that is not wired",
  *   the two fake-payload cases.
  * - src/pin.ts the `_status === 'published'` refusal: "an MCP write cannot publish, with or without a draft-only hook".
@@ -374,43 +372,6 @@ describe('the publish lane over MCP', () => {
       await call(secrets.all, 'updateCaseStudies', { id: live.id, title: 'First draft on live' })
       await call(secrets.all, 'updateCaseStudies', { id: live.id, title: 'Second draft on live' })
       expect((await status('case-studies', live.id, true)).title).toBe('Second draft on live')
-    })
-
-    it('saves before the owner unpublishes cannot prune the evidence away (maxPerDoc: 3)', async () => {
-      const live = await liveStudy()
-      // The document is live, so these are allowed: six drafts on top push the published version out of a history of 3.
-      for (let i = 0; i < 6; i += 1) await call(secrets.all, 'updateCaseStudies', { id: live.id, title: `Agent save ${i}` })
-      expect(
-        (await payload.findVersions({ collection: 'case-studies', where: { parent: { equals: live.id } } })).docs.some(
-          (v) => (v as any).version._status === 'published',
-        ),
-      ).toBe(false)
-      await payload.update({ collection: 'case-studies', data: { _status: 'draft' }, draft: false, id: live.id })
-      // Nothing proves it was never published: it is refused, not guessed.
-      expect(textOf((await call(secrets.all, 'updateCaseStudies', { id: live.id, title: 'After the unpublish' })).body)).toMatch(
-        /pruned version history/,
-      )
-      const dry = await dryRun('case-studies', live.id)
-      expect(failed(dry.body)).toBe(true)
-      expect(textOf(dry.body)).toMatch(/pruned version history/)
-      expect(failed((await publish({ collection: 'case-studies', digest: 'a'.repeat(64), id: live.id })).body)).toBe(true)
-      expect((await status('case-studies', live.id, false))._status).toBe('draft')
-      expect(textOf((await call(secrets.all, 'findCaseStudies', { limit: 100 })).body)).not.toMatch(new RegExp(`"id":${live.id},`))
-    })
-
-    it('a draft saved maxPerDoc times is refused, not guessed', async () => {
-      const created = await payload.create({
-        collection: 'case-studies',
-        data: { slug: uniq('busy'), title: 'Busy' } as never,
-        draft: true,
-      })
-      await call(secrets.all, 'updateCaseStudies', { id: created.id, title: 'Two' })
-      expect(textOf((await call(secrets.all, 'updateCaseStudies', { id: created.id, title: 'Three' })).body)).not.toMatch(
-        /pruned version history/,
-      )
-      expect(textOf((await call(secrets.all, 'updateCaseStudies', { id: created.id, title: 'Four' })).body)).toMatch(
-        /pruned version history/,
-      )
     })
 
     it('an MCP find does not list a document the owner took down, and lists the rest', async () => {
