@@ -24,8 +24,13 @@
   "files": [
     "dist",
     "!dist/**/*.map",
+    "bin",
+    "claude",
     "NOTICE"
   ],
+  "bin": {
+    "payload-mcp-publish": "./bin/payload-mcp-publish.mjs"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
