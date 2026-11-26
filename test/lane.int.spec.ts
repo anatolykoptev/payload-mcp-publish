@@ -211,7 +211,7 @@ describe('the publish lane over MCP', () => {
       const id = (await payload.find({ collection: 'case-studies', draft: true, where: { slug: { equals: slug } } })).docs[0]?.id as number
       expect((await status('case-studies', id, true))._status).toBe('draft')
       const { body: dry, digest } = await dryRun('case-studies', id)
-      expect(textOf(dry)).toContain('Never published')
+      expect(textOf(dry)).toContain('Never published (or its published history was pruned)')
       const { body } = await publish({ collection: 'case-studies', digest, id })
       expect(failed(body), textOf(body)).toBe(false)
       const anon = await payload.find({ collection: 'case-studies', overrideAccess: false, where: { id: { equals: id } } })
