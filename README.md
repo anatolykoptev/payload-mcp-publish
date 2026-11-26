@@ -111,16 +111,56 @@ access: {
 }
 ```
 
-## Approve each publish in Claude Code
+## Owner approval in Claude Code
 
-The digest proves the draft is the one that was shown. It is not consent. Add an `ask` rule so the call is shown to the owner
-before it runs. In `~/.claude/settings.json` (the server name is the one you gave the MCP server):
+The digest proves the draft is the one that was shown. It is not consent. Claude Code can ask the owner before each
+`publishDraft` call; there are two ways to set that up. Pick one (the server name is the one you gave the MCP server).
+
+**Per call: an `ask` rule.** Every `publishDraft` call prompts the owner. In `~/.claude/settings.json`:
 
 ```json
 "permissions": { "ask": ["mcp__<server>__publishDraft"] }
 ```
 
-Without the rule a key with the box ticked publishes unasked, as soon as an agent has run a dry run. Keep both layers.
+Without either, a key with the box ticked publishes unasked as soon as an agent has run a dry run. Keep one of the two.
+
+**Once per session: a grant.** The owner approves publishing once, by typing a phrase in the chat, and the calls that follow in
+that session run without a prompt. The package ships the Claude Code side:
+
+```sh
+npx payload-mcp-publish claude-hook install                       # grant: publish-ok, allow publishing; revoke: publish-stop, stop publishing
+npx payload-mcp-publish claude-hook install --grant "go live" --revoke "stop" --dry-run   # your own phrases; --dry-run prints the diff only
+npx payload-mcp-publish claude-hook uninstall
+```
+
+- **How it works.** A `UserPromptSubmit` hook looks at what the human typed. A prompt containing a grant phrase (case-insensitive,
+  any language) writes a grant file for that `session_id`; a revoke phrase deletes it. Only a prompt the human typed reaches that
+  event, so the agent cannot grant itself. A `PreToolUse` hook on `mcp__<server>__publishDraft` answers `allow` when the session has
+  a grant younger than 24 hours, and `ask` otherwise, with a reason that names the grant phrase. A missing or malformed
+  `session_id` always asks. The hook never trusts a malformed id: it is not cleaned up into a valid one.
+- **What install changes** in `~/.claude/settings.json` (a timestamped backup first; running it again changes nothing; every other
+  key and hook stays as it was): it registers the two hooks, adds `deny` rules `Write(<grant dir>/**)` and `Edit(<grant dir>/**)`,
+  and removes the `permissions.ask` entries for `publishDraft`. It prints each change, and the removed rules so you can put them
+  back. `uninstall` reverses what install added; the removed `ask` rules are printed, not restored. `--settings <path>` targets
+  another file (the hook is copied to a `hooks/` folder next to it). The hook, its config
+  (`payload-mcp-publish-grant.config.json`: `grantPhrases`, `revokePhrases`, `maxAgeSeconds`, `grantDir`) and the grants live in
+  `~/.claude/hooks` and `~/.claude/state/publish-grants`.
+- **Why the `ask` rules must go.** Claude Code evaluates `deny`, then `ask`, then `allow`, and a hook's `allow` never overrides an
+  `ask` rule. While an `ask` rule for `publishDraft` exists, the prompt always appears and a grant cannot take effect. An `ask`
+  rule that covers a whole server (`mcp__<server>`) has the same effect: install warns about it and leaves it alone.
+- **Failure behaviour.** The `PreToolUse` command ends in `|| exit 2`: if the hook crashes or `node` is missing, the call is
+  blocked. The `UserPromptSubmit` command ends in `|| exit 0`: a crash never blocks the owner's prompt, it only means no grant.
+
+Security notes:
+
+- The grant covers `publishDraft` on **every** site (every MCP server) in that session, not one collection or document.
+- The dry run, the digest and showing the owner the diff still apply: the grant removes the prompt, not the review. Tell the agent
+  to show the owner the dry-run diff before it publishes.
+- The `deny` rules cover Claude's `Write` and `Edit` tools only. A shell command (`Bash`) could still write the grant directory;
+  restrict `Bash` in your permissions if that matters.
+- A phrase is matched as a substring of the prompt, so a prompt that merely contains one (a pasted page, "do not allow publishing")
+  grants. Choose phrases that do not appear in ordinary text.
+- Publish-capable API keys stay the real boundary: the tool is unticked on every key and a key needs its own `update` box.
 
 ## Not covered
 

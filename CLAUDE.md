@@ -7,6 +7,8 @@ vitest, biome, release-please. One public entry, `src/index.ts`. Every document 
 
 - `src/lane.ts`: `mcpPublishLane`, `overrideAuth`, `offByDefault`. `src/tool.ts`: the `publishDraft` handler and gate types.
 - `src/diff.ts`: full-text diff and digest. `src/pin.ts`: the `beforeChange` hook. `src/ownerUnpublished.ts`, `src/access.ts`.
+- `claude/publish-grant-hook.mjs`: the Claude Code session-grant hook (standalone, no dependencies). `bin/payload-mcp-publish.mjs`:
+  the `claude-hook install|uninstall` CLI. Tests: `test/claude-hook.spec.ts`, `test/claude-install.spec.ts` (spawn the real files).
 - `test/lane.int.spec.ts`: Payload on SQLite, driven through the real `POST /api/mcp` with real API keys. Its header lists
   the mutation table (production line to the test that goes red). `test/fixtures/` is the test site.
 
