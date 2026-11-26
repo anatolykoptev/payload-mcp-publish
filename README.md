@@ -160,13 +160,17 @@ npx payload-mcp-publish claude-hook uninstall
   install warns about it and leaves it alone.
 - **Failure behaviour.** `PreToolUse` fails closed: its command ends in `|| exit 2`, and it sets `"onFailure": "block"` (Claude
   Code 2.1.295 or later, "Block the action when a hook fails" in the hooks reference), so a crash, an unreadable event, a missing
-  `node` or a timeout blocks the call. `UserPromptSubmit` and `PostToolUse` fail open (`|| exit 0`): a crash never blocks the
-  owner's prompt, it only means no grant (or no revoke).
+  `node` or a timeout blocks the call. On an older Claude Code the field is not honoured and only `|| exit 2` remains: a crash or
+  unreadable event still blocks, a timeout does not. `UserPromptSubmit` and `PostToolUse` fail open (`|| exit 0`): a crash never
+  blocks the owner's prompt, it only means no grant (or no revoke).
 
 Security notes:
 
 - The grant is the owner's Yes in the dialog for **one** call. It then covers `publishDraft` on **every** MCP server, and every
   subagent of that session, until it is revoked or `maxAgeSeconds` (24 hours) passes.
+- Whatever answers the first prompt is the approver. If you configured another one (a `PermissionRequest` hook, the Agent SDK's
+  `canUseTool`, `--permission-prompt-tool`), its Yes grants the session just as the owner's does. Install warns when a
+  `PermissionRequest` group's matcher would match `publishDraft`.
 - The dry run, the digest and showing the owner the diff still apply: the grant removes the prompt, not the review. Tell the agent
   to show the owner the dry-run diff before it publishes; the dialog of the first call is where the owner sees what the grant covers.
 - The `deny` rules cover Claude's file-edit tools (`Edit` also covers `Write` and shell redirects such as `>` and `tee` that Claude

@@ -231,6 +231,29 @@ const projectAskWarnings = (settingsPath) => {
   return out
 }
 
+/**
+ * A PermissionRequest hook whose matcher covers publishDraft can answer the first prompt instead of the owner, and that
+ * answer grants the session. The matcher is an exact tool name or a regular expression; none, "" and "*" match every tool.
+ */
+const permissionRequestWarnings = (settings) => {
+  const sample = `mcp__server__${TOOL_NAME}`
+  const matches = (matcher) => {
+    if (matcher === undefined || matcher === '' || matcher === '*') return true
+    try {
+      return new RegExp(`^(?:${matcher})$`).test(sample)
+    } catch {
+      return false
+    }
+  }
+  const groups = Array.isArray(settings.hooks?.PermissionRequest) ? settings.hooks.PermissionRequest : []
+  return groups
+    .filter((g) => matches(g?.matcher))
+    .map(
+      (g) =>
+        `Warning: a PermissionRequest hook (matcher ${JSON.stringify(g?.matcher ?? '')}) matches ${TOOL_NAME}. If it answers the first prompt, that answer grants the session; it must be the owner's decision.`,
+    )
+}
+
 const dropEmptyPermissions = (settings) => {
   if (settings.permissions && Object.keys(settings.permissions).length === 0) delete settings.permissions
 }
@@ -302,7 +325,7 @@ const install = (o) => {
     out.push(
       `Warning: permissions.ask also holds ${broad.join(', ')}. An ask rule beats a hook "allow", so it keeps prompting on publishDraft; remove it for the session grant to work.`,
     )
-  out.push(...projectAskWarnings(settingsPath))
+  out.push(...permissionRequestWarnings(settings), ...projectAskWarnings(settingsPath))
   out.push(
     `Grant: the owner's Yes in the permission dialog for one publishDraft call. Revoke phrases: ${config.revokePhrases.join(', ')}. State: ${grantDir}`,
   )
@@ -358,10 +381,17 @@ const uninstall = (o) => {
   return out.join('\n')
 }
 
-try {
-  const o = parseArgs(process.argv.slice(2))
-  console.log(o.action === 'install' ? install(o) : uninstall(o))
-} catch (e) {
-  console.error(e.cli ? e.message : `payload-mcp-publish: ${e.stack ?? e}`)
-  process.exitCode = 1
+const main = () => {
+  try {
+    const o = parseArgs(process.argv.slice(2))
+    console.log(o.action === 'install' ? install(o) : uninstall(o))
+  } catch (e) {
+    console.error(e.cli ? e.message : `payload-mcp-publish: ${e.stack ?? e}`)
+    process.exitCode = 1
+  }
 }
+
+export { readSettings, writeSettings }
+
+// Run only as a script (the tests import the two functions above).
+if (process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url))) main()

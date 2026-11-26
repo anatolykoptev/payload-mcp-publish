@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 /**
@@ -167,6 +167,33 @@ describe('claude-hook install', () => {
     expect(r.err).toContain('not valid JSON')
     expect(readFileSync(settings, 'utf8')).toBe('{ nope')
     expect(existsSync(hookPath())).toBe(false)
+  })
+
+  it('refuses to write when the settings file changed after it was read, leaving the new content and no temp file', async () => {
+    seed()
+    const bin: any = await import(pathToFileURL(BIN).href) // a variable specifier: the .mjs has no type declarations
+    const before = bin.readSettings(settings)
+    const edited = `${JSON.stringify({ ...original, model: 'edited meanwhile' }, null, 4)}\n`
+    writeFileSync(settings, edited) // the owner saves the file between our read and our write
+    const after = { ...before, settings: { ...before.settings, hooks: {} } }
+    expect(() => bin.writeSettings(settings, before, after)).toThrow(/changed while the installer was running/)
+    expect(readFileSync(settings, 'utf8')).toBe(edited)
+    expect(readdirSync(join(home, '.claude')).filter((f) => f.includes('.tmp-') || f.includes('.bak-'))).toEqual([])
+    // and an unchanged file is written
+    const fresh = bin.readSettings(settings)
+    bin.writeSettings(settings, fresh, { ...fresh, settings: { ...fresh.settings, model: 'ours' } })
+    expect(read().model).toBe('ours')
+  })
+
+  it('warns when a PermissionRequest hook matcher covers publishDraft, and only then', () => {
+    const hook = { hooks: [{ type: 'command', command: 'echo' }] }
+    seed({ hooks: { PermissionRequest: [{ matcher: 'mcp__.*__publishDraft', ...hook }, { matcher: 'Bash', ...hook }, hook] } })
+    const r = install()
+    expect(r.out.match(/a PermissionRequest hook/g)).toHaveLength(2) // the regex matcher and the matcher-less group
+    expect(r.out).toContain('"mcp__.*__publishDraft"')
+    rmSync(settings)
+    seed({ hooks: { PermissionRequest: [{ matcher: 'Bash', ...hook }] } })
+    expect(install().out).not.toContain('PermissionRequest')
   })
 
   it('warns about a server-wide ask rule, which would still beat the grant', () => {
