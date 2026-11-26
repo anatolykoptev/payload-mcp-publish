@@ -120,7 +120,9 @@ export const makePublishDraft = (o: PublishToolOptions) => async (args: Record<s
           text: [
             `DRY RUN, nothing published: ${name} (#${String(id)}).`,
             `Digest: ${current}`,
-            live ? 'Changes against the live version (every changed field, in full):' : 'Never published: the whole document is new:',
+            live
+              ? 'Changes against the live version (every changed field, in full):'
+              : 'Never published (or its published history was pruned): the whole document is shown:',
             ...diffSummary(live, latest),
             ...(Object.keys(gateData).length ? ['The publish will also set (in full):', ...diffSummary(undefined, gateData)] : []),
             'Show the owner this, then call again with `digest`.',
