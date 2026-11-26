@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/anatolykoptev/payload-mcp-publish/compare/v0.1.2...v0.1.3) (2026-11-26)
+
+
+### Bug Fixes
+
+* **release:** open release PRs with the release-bot App token so they get CI ([#6](https://github.com/anatolykoptev/payload-mcp-publish/issues/6)) ([9f29ff5](https://github.com/anatolykoptev/payload-mcp-publish/commit/9f29ff505c0a74c20732de04932b994d803f407b))
+* **tool:** tell the caller gate arguments go on the dry run and the publish ([#4](https://github.com/anatolykoptev/payload-mcp-publish/issues/4)) ([ec3e587](https://github.com/anatolykoptev/payload-mcp-publish/commit/ec3e58780ac640d76165b4f701debdc5342421c9))
+
 ## [0.1.2](https://github.com/anatolykoptev/payload-mcp-publish/compare/v0.1.1...v0.1.2) (2026-11-26)
 
 
