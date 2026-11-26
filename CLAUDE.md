@@ -1,7 +1,7 @@
 # payload-mcp-publish: notes for agents
 
 A Payload CMS 3 helper for `@payloadcms/plugin-mcp` 3: a reviewed publish lane (`publishDraft`). TypeScript, ESM, pnpm,
-vitest, biome, release-please. One public entry, `src/index.ts`.
+vitest, biome, release-please. One public entry, `src/index.ts`. Every document is indexed in [docs/INDEX.md](docs/INDEX.md).
 
 ## Layout
 
