@@ -18,7 +18,7 @@ No code change, no deploy.
 - **The key's own scope.** The tool is unticked on every key (the plugin registers custom tools ticked), and a key also needs
   its own `update` box for the collection: the tool never widens a key.
 - **A collection allowlist.** Only the collections you list can publish from here.
-- **What the owner took down stays down.** Payload keeps no record that the owner unpublished a document: a never-published
+- **What the owner took down stays down while its published version is in the history.** Payload keeps no record that the owner unpublished a document: a never-published
   and an unpublished document both have a draft live row, and the only evidence is the version history. A document whose live
   row is not published and that has a published version in its history is `retired`: `publishDraft` refuses it, **every MCP
   update of it is refused** (so an agent cannot push the evidence out by saving drafts), and `hideOwnerUnpublishedFromMcp`
