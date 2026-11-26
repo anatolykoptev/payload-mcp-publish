@@ -1,6 +1,6 @@
 {
   "name": "payload-mcp-publish",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "A reviewed publish lane for @payloadcms/plugin-mcp: dry-run diff plus digest, key-scope check, owner-unpublished guard.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/anatolykoptev/payload-mcp-publish#readme",
