@@ -170,7 +170,7 @@ export const makePublishDraft = (o: PublishToolOptions) => async (args: Record<s
 export const publishDraftDescription =
   'Publish ONE reviewed draft: the latest draft of one document, exactly as it stands. Two steps. ' +
   '1) Call with `dryRun: true`: nothing changes; it returns every field that would change, in full, and a `digest`. SHOW THAT DIFF TO THE OWNER and wait for their yes. ' +
-  '2) Call again without `dryRun`, passing that `digest`; the owner approves this call. It is refused when the draft changed since the dry run, ' +
+  '2) Call again without `dryRun`, passing that `digest` and exactly the same other arguments (any gate arguments such as `verification` go on BOTH calls: the digest covers them); the owner approves this call. It is refused when the draft or those arguments changed since the dry run, ' +
   'when there is no pending draft, when the owner unpublished the document, and when the key cannot update that collection. ' +
   "The digest is not the owner's consent: it only proves the draft is the one that was shown. Returns what changed and, when the site gives one, the live URL."
 
