@@ -63,7 +63,8 @@ export const standingOf = async (
  * One query for the drafts and one for their versions.
  */
 export const ownerUnpublishedIds = async (payload: Payload, collection: CollectionSlug): Promise<(number | string)[]> => {
-  const drafts = await payload.find({
+  // Same test as `standingOf`: a live row that is not published (a null status included).
+  const notLive = await payload.find({
     collection,
     depth: 0,
     draft: false,
@@ -71,22 +72,18 @@ export const ownerUnpublishedIds = async (payload: Payload, collection: Collecti
     overrideAccess: true,
     pagination: false,
     select: {},
-    where: { _status: { equals: 'draft' } },
+    where: { _status: { not_equals: 'published' } },
   })
-  if (!drafts.docs.length) return []
+  if (!notLive.docs.length) return []
+  // Only the published versions of those documents: a handful of rows, one `parent` each.
   const { docs } = await payload.findVersions({
     collection,
     depth: 0,
     limit: 0,
     overrideAccess: true,
     pagination: false,
-    select: SELECT as never,
-    where: { parent: { in: drafts.docs.map((d) => d.id) } },
+    select: { parent: true } as never,
+    where: { and: [{ parent: { in: notLive.docs.map((d) => d.id) } }, { 'version._status': { equals: 'published' } }] },
   })
-  const byParent = new Map<number | string, Version[]>()
-  for (const raw of docs) {
-    const v = toVersion(raw)
-    byParent.set(v.parent, [...(byParent.get(v.parent) ?? []), v])
-  }
-  return drafts.docs.filter((d) => judge(byParent.get(d.id) ?? []) !== 'never').map((d) => d.id)
+  return [...new Set(docs.map((v) => (v as unknown as { parent: number | string }).parent))]
 }

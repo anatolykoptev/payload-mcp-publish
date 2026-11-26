@@ -133,4 +133,21 @@ describe('rich text rendering', () => {
     expect(lines).toContain('\\"value\\":2')
     expect(lines).not.toContain('identical')
   })
+
+  it('shows where an internal link points, so a repointed one is a change', () => {
+    const link = (id: number) => ({
+      children: [{ text: 'read more', type: 'text' }],
+      fields: { doc: { relationTo: 'posts', value: id }, linkType: 'internal', newTab: false },
+      type: 'link',
+    })
+    const text = lexicalText({ root: { children: [{ children: [link(3)], type: 'paragraph' }], type: 'root' } })
+    expect(text).toContain('read more')
+    expect(text).toContain('"value":3')
+    const lines = diffSummary(
+      { body: { root: { children: [link(3)], type: 'root' } } },
+      { body: { root: { children: [link(4)], type: 'root' } } },
+    ).join('\n')
+    expect(lines).toContain('\\"value\\":4')
+    expect(lines).not.toContain('identical')
+  })
 })

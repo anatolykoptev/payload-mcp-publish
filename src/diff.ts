@@ -38,8 +38,11 @@ const lexicalNode = (node: unknown): string => {
   if (type === 'linebreak') return '\n'
   const inner = Array.isArray(node.children) ? node.children.map(lexicalNode).join('') : ''
   if (type === 'link' || type === 'autolink') {
-    const url = (node.fields as { url?: string } | undefined)?.url ?? (node.url as string | undefined)
-    return url ? `${inner} (${url})` : inner
+    // An external link has a url; an internal one points at a document (`fields.doc`). Anything else a link carries is shown too.
+    const { newTab: _newTab, ...fields } = (node.fields ?? {}) as Record<string, unknown>
+    const url = typeof fields.url === 'string' ? fields.url : (node.url as string | undefined)
+    if (url) return `${inner} (${url})`
+    return Object.keys(fields).length ? `${inner} (${JSON.stringify(canonical(fields))})` : inner
   }
   if (type === 'heading') return `${'#'.repeat(Number(String(node.tag ?? 'h1').replace(/\D/g, '')) || 1)} ${inner}\n`
   if (!PLAIN.has(type)) {
