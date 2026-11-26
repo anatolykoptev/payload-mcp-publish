@@ -1,7 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.6.8/schema.json",
   "files": {
-    "includes": ["**", "!dist", "!**/*.tsbuildinfo", "!CHANGELOG.md", "!test/.tmp"]
+    "includes": ["**", "!dist", "!**/*.tsbuildinfo", "!CHANGELOG.md", "!.release-please-manifest.json", "!test/.tmp"]
   },
   "formatter": {
     "indentStyle": "space",
