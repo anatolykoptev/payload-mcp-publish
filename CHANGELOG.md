@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/anatolykoptev/payload-mcp-publish/compare/v0.1.3...v0.2.0) (2026-11-26)
+
+
+### Features
+
+* **claude:** once-per-session owner approval for publishDraft ([#7](https://github.com/anatolykoptev/payload-mcp-publish/issues/7)) ([fee08c2](https://github.com/anatolykoptev/payload-mcp-publish/commit/fee08c24f9de0dca36f335a4da24ee06e4d70715))
+
 ## [0.1.3](https://github.com/anatolykoptev/payload-mcp-publish/compare/v0.1.2...v0.1.3) (2026-11-26)
 
 
