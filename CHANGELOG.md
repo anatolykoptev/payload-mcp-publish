@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/anatolykoptev/payload-mcp-publish/compare/v0.1.1...v0.1.2) (2026-11-26)
+
+
+### Bug Fixes
+
+* **release:** keep release-please's manifest out of the formatter ([7b2db69](https://github.com/anatolykoptev/payload-mcp-publish/commit/7b2db69d591e24190e96ecfe6dadc1ae00904fb3))
+
 ## [0.1.1](https://github.com/anatolykoptev/payload-mcp-publish/compare/v0.1.0...v0.1.1) (2026-11-26)
 
 
