@@ -113,7 +113,7 @@ access: {
 
 ## Owner approval in Claude Code
 
-The digest proves the draft is the one that was shown. It is not consent. Claude Code can ask the owner before each
+The digest proves the draft is the one that was shown. It is not consent. Claude Code can ask the owner before a
 `publishDraft` call; there are two ways to set that up. Pick one (the server name is the one you gave the MCP server).
 
 **Per call: an `ask` rule.** Every `publishDraft` call prompts the owner. In `~/.claude/settings.json`:
@@ -124,42 +124,55 @@ The digest proves the draft is the one that was shown. It is not consent. Claude
 
 Without either, a key with the box ticked publishes unasked as soon as an agent has run a dry run. Keep one of the two.
 
-**Once per session: a grant.** The owner approves publishing once, by typing a phrase in the chat, and the calls that follow in
-that session run without a prompt. The package ships the Claude Code side:
+**Once per session: the owner's Yes grants.** The owner answers the permission dialog of one `publishDraft` call with Yes; the
+rest of that session's calls run without a prompt. The package ships the Claude Code side:
 
 ```sh
-npx payload-mcp-publish claude-hook install                       # grant: publish-ok, allow publishing; revoke: publish-stop, stop publishing
-npx payload-mcp-publish claude-hook install --grant "go live" --revoke "stop" --dry-run   # your own phrases; --dry-run prints the diff only
+npx payload-mcp-publish claude-hook install                       # revoke phrases: publish-stop, stop publishing
+npx payload-mcp-publish claude-hook install --revoke "pull the plug" --dry-run   # your own revoke phrase; --dry-run prints the diff only
 npx payload-mcp-publish claude-hook uninstall
 ```
 
-- **How it works.** A `UserPromptSubmit` hook looks at what the human typed. A prompt containing a grant phrase (case-insensitive,
-  any language) writes a grant file for that `session_id`; a revoke phrase deletes it. Only a prompt the human typed reaches that
-  event, so the agent cannot grant itself. A `PreToolUse` hook on `mcp__<server>__publishDraft` answers `allow` when the session has
-  a grant younger than 24 hours, and `ask` otherwise, with a reason that names the grant phrase. A missing or malformed
-  `session_id` always asks. The hook never trusts a malformed id: it is not cleaned up into a valid one.
-- **What install changes** in `~/.claude/settings.json` (a timestamped backup first; running it again changes nothing; every other
-  key and hook stays as it was): it registers the two hooks, adds `deny` rules `Write(<grant dir>/**)` and `Edit(<grant dir>/**)`,
-  and removes the `permissions.ask` entries for `publishDraft`. It prints each change, and the removed rules so you can put them
-  back. `uninstall` reverses what install added; the removed `ask` rules are printed, not restored. `--settings <path>` targets
-  another file (the hook is copied to a `hooks/` folder next to it). The hook, its config
-  (`payload-mcp-publish-grant.config.json`: `grantPhrases`, `revokePhrases`, `maxAgeSeconds`, `grantDir`) and the grants live in
-  `~/.claude/hooks` and `~/.claude/state/publish-grants`.
+- **How it works.** A `PreToolUse` hook on `mcp__<server>__publishDraft` answers `allow` while the session has a fresh grant
+  (24 hours by default). Otherwise it records the call's `tool_use_id` as pending and answers `ask`, so the owner gets the
+  dialog; the reason tells them that a Yes approves `publishDraft` for the rest of the session and which phrase revokes it. A
+  `PostToolUse` hook runs after the call: if its `tool_use_id` is the pending one the hook itself asked about, the owner said Yes,
+  and the session is granted (an empty file named after the `session_id`). A `UserPromptSubmit` hook only **revokes**: a prompt
+  containing a revoke phrase (case-insensitive substring, any language) deletes the grant. Nothing a prompt says can grant.
+- **Why a typed phrase cannot grant.** `UserPromptSubmit` does not fire only for what the owner types: it also fires for
+  scheduled tasks, `/loop`, a background subagent's report and messages from other sessions (see the hooks reference). A phrase
+  quoted in any of those would have granted. A revoke phrase is safe in that direction: a spurious revoke only asks again.
+- **Modes where nobody answers.** A call in `bypassPermissions` or `dontAsk` mode never grants (no human saw a dialog). In
+  `auto` mode the hook's `ask` still reaches the human; this is an assumption about Claude Code's behaviour, so check it on your
+  version before relying on it. A missing or malformed `session_id` or `tool_use_id` never allows and never grants.
+- **What install changes** in `~/.claude/settings.json` (a timestamped backup first, written through a temp file and a rename, and
+  refused if the file changed meanwhile; running it again changes nothing; every other key and hook stays): it registers the
+  three hooks, adds `deny` rules `Edit(<grant dir>/**)` and `Edit(<hooks dir>/payload-mcp-publish-grant*)` (so the agent cannot
+  edit the grants, the installed hook or its config), and removes the `permissions.ask` entries for `publishDraft`. It prints each
+  change and the removed rules. `uninstall` reverses it: it removes what install added and **restores** the removed `ask` rules.
+  Only `Edit` rules are added: the permissions reference matches file rules against the Edit tool family, so a `Write(path)` rule
+  is inert. `--settings <path>` targets another file (the hook is copied to a `hooks/` folder next to it). The hook, its config
+  (`payload-mcp-publish-grant.config.json`: `revokePhrases`, `maxAgeSeconds`, `grantDir`) and the state live in `~/.claude/hooks`
+  and `~/.claude/state/publish-grants`.
 - **Why the `ask` rules must go.** Claude Code evaluates `deny`, then `ask`, then `allow`, and a hook's `allow` never overrides an
   `ask` rule. While an `ask` rule for `publishDraft` exists, the prompt always appears and a grant cannot take effect. An `ask`
-  rule that covers a whole server (`mcp__<server>`) has the same effect: install warns about it and leaves it alone.
-- **Failure behaviour.** The `PreToolUse` command ends in `|| exit 2`: if the hook crashes or `node` is missing, the call is
-  blocked. The `UserPromptSubmit` command ends in `|| exit 0`: a crash never blocks the owner's prompt, it only means no grant.
+  rule that covers a whole server (`mcp__<server>`), or one in a project's `.claude/settings.json` or `settings.local.json`, has the same effect:
+  install warns about it and leaves it alone.
+- **Failure behaviour.** `PreToolUse` fails closed: its command ends in `|| exit 2`, and it sets `"onFailure": "block"` (Claude
+  Code 2.1.295 or later, "Block the action when a hook fails" in the hooks reference), so a crash, an unreadable event, a missing
+  `node` or a timeout blocks the call. `UserPromptSubmit` and `PostToolUse` fail open (`|| exit 0`): a crash never blocks the
+  owner's prompt, it only means no grant (or no revoke).
 
 Security notes:
 
-- The grant covers `publishDraft` on **every** site (every MCP server) in that session, not one collection or document.
+- The grant is the owner's Yes in the dialog for **one** call. It then covers `publishDraft` on **every** MCP server, and every
+  subagent of that session, until it is revoked or `maxAgeSeconds` (24 hours) passes.
 - The dry run, the digest and showing the owner the diff still apply: the grant removes the prompt, not the review. Tell the agent
-  to show the owner the dry-run diff before it publishes.
-- The `deny` rules cover Claude's `Write` and `Edit` tools only. A shell command (`Bash`) could still write the grant directory;
-  restrict `Bash` in your permissions if that matters.
-- A phrase is matched as a substring of the prompt, so a prompt that merely contains one (a pasted page, "do not allow publishing")
-  grants. Choose phrases that do not appear in ordinary text.
+  to show the owner the dry-run diff before it publishes; the dialog of the first call is where the owner sees what the grant covers.
+- The `deny` rules cover Claude's file-edit tools (`Edit` also covers `Write` and shell redirects such as `>` and `tee` that Claude
+  Code recognises). They do not cover `touch`, `cp`, `node -e` or any other command run through `Bash`: unrestricted `Bash` can
+  forge a grant file. That is no escalation beyond what unrestricted `Bash` already allows (it can run the CLI or edit the
+  settings); sandbox `Bash` if you need the boundary.
 - Publish-capable API keys stay the real boundary: the tool is unticked on every key and a key needs its own `update` box.
 
 ## Not covered

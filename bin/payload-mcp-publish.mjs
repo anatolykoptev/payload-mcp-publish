@@ -4,27 +4,40 @@
  * that lets the owner approve `publishDraft` once per session (see the README, "Owner approval in Claude Code").
  * No dependencies.
  */
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { TOOL_NAME } from '../claude/publish-grant-hook.mjs'
 
 const HOOK_NAME = 'payload-mcp-publish-grant.mjs'
 const CONFIG_NAME = 'payload-mcp-publish-grant.config.json'
 const HOOK_SOURCE = fileURLToPath(new URL('../claude/publish-grant-hook.mjs', import.meta.url))
 const DEFAULT_GRANT_DIR = '~/.claude/state/publish-grants'
-const PUBLISH_MATCHER = 'mcp__.*__publishDraft'
+const PUBLISH_MATCHER = `mcp__.*__${TOOL_NAME}`
 // The permission-rule glob `mcp__*__publishDraft` (`*` is any run of characters).
-const PUBLISH_ASK = /^mcp__.*__publishDraft$/
+const PUBLISH_ASK = new RegExp(`^mcp__.*__${TOOL_NAME}$`)
 // An ask rule that covers a whole server or every MCP tool also covers publishDraft; it is reported, never removed.
 const BROAD_ASK = /^mcp__([A-Za-z0-9_-]+|\*)(__\*)?$/
 
 const USAGE = `Usage:
-  payload-mcp-publish claude-hook install [--grant <phrase>]... [--revoke <phrase>]... [--grant-dir <dir>] [--settings <path>] [--dry-run]
+  payload-mcp-publish claude-hook install [--revoke <phrase>]... [--grant-dir <dir>] [--settings <path>] [--dry-run]
   payload-mcp-publish claude-hook uninstall [--settings <path>] [--dry-run]
 
-Defaults: settings ~/.claude/settings.json (the hook is copied to a hooks/ folder next to it), grant phrases
-"publish-ok" and "allow publishing", revoke phrases "publish-stop" and "stop publishing", grant dir ${DEFAULT_GRANT_DIR}.`
+Defaults: settings ~/.claude/settings.json (the hook is copied to a hooks/ folder next to it), revoke phrases
+"publish-stop" and "stop publishing", grant dir ${DEFAULT_GRANT_DIR}. There are no grant phrases: the owner's Yes in the
+permission dialog is the grant.`
 
 const fail = (message) => {
   throw Object.assign(new Error(message), { cli: true })
@@ -32,17 +45,18 @@ const fail = (message) => {
 
 const expandHome = (p) => (p === '~' || p.startsWith('~/') ? join(homedir(), p.slice(1)) : resolve(p))
 
-/** How a path is spelled in a Claude Code permission rule: `~/` under home, `//` for any other absolute path. */
+/** How a path is spelled in a Claude Code permission rule: `~/` under home, `//` for any other absolute path; always `/`. */
 const ruleDir = (dir) => {
   const home = homedir()
-  if (dir === home || dir.startsWith(home + sep)) return `~/${dir.slice(home.length + 1)}`.replace(/\/$/, '')
-  return `/${dir}`
+  const posix = (p) => p.split(sep).join('/')
+  if (dir === home || dir.startsWith(home + sep)) return `~/${posix(dir.slice(home.length + 1))}`.replace(/\/$/, '')
+  return `/${posix(dir)}`
 }
 
 const parseArgs = (argv) => {
   const [group, action, ...rest] = argv
   if (group !== 'claude-hook' || (action !== 'install' && action !== 'uninstall')) fail(USAGE)
-  const o = { action, grant: [], revoke: [], dryRun: false }
+  const o = { action, revoke: [], dryRun: false }
   for (let i = 0; i < rest.length; i++) {
     const flag = rest[i]
     const value = () => {
@@ -52,12 +66,15 @@ const parseArgs = (argv) => {
     }
     if (flag === '--dry-run') o.dryRun = true
     else if (flag === '--settings') o.settings = value()
-    else if (action === 'install' && flag === '--grant') o.grant.push(value())
+    else if (action === 'install' && flag === '--grant')
+      fail(
+        "--grant is gone: a typed phrase cannot grant (UserPromptSubmit also fires for scheduled tasks and subagent reports). The owner's Yes in the permission dialog grants.",
+      )
     else if (action === 'install' && flag === '--revoke') o.revoke.push(value())
     else if (action === 'install' && flag === '--grant-dir') o.grantDir = value()
     else fail(`unknown argument ${flag}\n${USAGE}`)
   }
-  for (const p of [...o.grant, ...o.revoke]) if (p.trim() === '') fail('a phrase may not be blank: it would match every prompt')
+  for (const p of o.revoke) if (p.trim() === '') fail('a phrase may not be blank: it would match every prompt')
   return o
 }
 
@@ -74,9 +91,9 @@ const readJson = (path, what) => {
 }
 
 const readSettings = (path) => {
-  if (!existsSync(path)) return { settings: {}, indent: '  ', eol: '\n', existed: false }
+  if (!existsSync(path)) return { settings: {}, indent: '  ', eol: '\n', existed: false, raw: null }
   const { value, raw } = readJson(path, 'settings file')
-  return { settings: value, indent: raw.match(/^([ \t]+)"/m)?.[1] ?? '  ', eol: raw.endsWith('\n') ? '\n' : '', existed: true }
+  return { settings: value, indent: raw.match(/^([ \t]+)"/m)?.[1] ?? '  ', eol: raw.endsWith('\n') ? '\n' : '', existed: true, raw }
 }
 
 const render = (s) => `${JSON.stringify(s.settings, null, s.indent)}${s.eol}`
@@ -94,19 +111,23 @@ const withoutOurs = (groups) =>
 
 const ourGroups = (groups) => groups.filter((g) => Array.isArray(g?.hooks) && g.hooks.some(isOurs))
 
+const EVENTS = ['UserPromptSubmit', 'PreToolUse', 'PostToolUse']
+
 const desiredGroup = (hookPath, event) => {
-  // UserPromptSubmit fails open (a crash must not block the owner's prompt); PreToolUse fails closed (exit 2 blocks the call).
-  const suffix = event === 'PreToolUse' ? 'exit 2' : 'exit 0'
-  const group = { hooks: [{ type: 'command', command: `node "${hookPath}" || ${suffix}` }] }
-  return event === 'PreToolUse' ? { matcher: PUBLISH_MATCHER, ...group } : group
+  // PreToolUse fails closed: `|| exit 2` blocks the call, and `onFailure: "block"` (Claude Code >= 2.1.295, see the hooks
+  // reference, "Block the action when a hook fails") also blocks on a timeout or a hook that cannot start. The other
+  // events fail open: a crash never blocks the owner's prompt or a finished call.
+  const pre = event === 'PreToolUse'
+  const hook = { type: 'command', command: `node "${hookPath}" || exit ${pre ? 2 : 0}`, ...(pre ? { onFailure: 'block' } : {}) }
+  return event === 'UserPromptSubmit' ? { hooks: [hook] } : { matcher: PUBLISH_MATCHER, hooks: [hook] }
 }
 
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
 
-/** Adds our two hook groups, leaving them in place when they are already exactly right. */
+/** Adds our hook groups, leaving them in place when they are already exactly right. */
 const addHooks = (settings, hookPath, changes) => {
   settings.hooks ??= {}
-  for (const event of ['UserPromptSubmit', 'PreToolUse']) {
+  for (const event of EVENTS) {
     const groups = Array.isArray(settings.hooks[event]) ? settings.hooks[event] : []
     const want = desiredGroup(hookPath, event)
     const have = ourGroups(groups)
@@ -121,7 +142,7 @@ const addHooks = (settings, hookPath, changes) => {
 
 const removeHooks = (settings, changes) => {
   if (!settings.hooks) return
-  for (const event of ['UserPromptSubmit', 'PreToolUse']) {
+  for (const event of EVENTS) {
     const groups = settings.hooks[event]
     if (!Array.isArray(groups) || ourGroups(groups).length === 0) continue
     const kept = withoutOurs(groups)
@@ -166,28 +187,63 @@ const lineDiff = (before, after) => {
   return out.join('\n')
 }
 
+/** Writes settings through a temp file and a rename, refusing if the file changed since it was read. */
 const writeSettings = (path, before, after) => {
-  const next = render(after)
-  mkdirSync(dirname(path), { recursive: true })
+  const target = existsSync(path) ? realpathSync(path) : path
+  mkdirSync(dirname(target), { recursive: true })
+  const unchanged = () => (existsSync(target) ? readFileSync(target, 'utf8') : null) === before.raw
+  const tmp = `${target}.tmp-${process.pid}`
+  writeFileSync(tmp, render(after), { mode: before.existed ? statSync(target).mode & 0o777 : 0o600 })
+  if (!unchanged()) {
+    rmSync(tmp, { force: true })
+    fail(`${target} changed while the installer was running; nothing was written. Run the command again.`)
+  }
   let backup = null
   if (before.existed) {
-    backup = `${path}.bak-${new Date().toISOString().replace(/[:.]/g, '-')}`
-    copyFileSync(path, backup)
+    backup = `${target}.bak-${new Date().toISOString().replace(/[:.]/g, '-')}`
+    copyFileSync(target, backup)
   }
-  writeFileSync(path, next)
+  renameSync(tmp, target)
   return backup
+}
+
+const askRulesOf = (settings) =>
+  Array.isArray(settings?.permissions?.ask) ? settings.permissions.ask.filter((r) => typeof r === 'string') : []
+
+/** Project settings in the current directory that still hold ask rules covering publishDraft (they would beat the grant). */
+const projectAskWarnings = (settingsPath) => {
+  const out = []
+  for (const name of ['settings.json', 'settings.local.json']) {
+    const file = resolve('.claude', name)
+    if (file === settingsPath || !existsSync(file)) continue
+    let parsed
+    try {
+      parsed = JSON.parse(readFileSync(file, 'utf8'))
+    } catch {
+      continue
+    }
+    const hits = askRulesOf(parsed).filter((r) => PUBLISH_ASK.test(r) || BROAD_ASK.test(r))
+    if (hits.length)
+      out.push(
+        `Warning: ${file} holds permissions.ask ${hits.join(', ')}. It beats the grant; remove it there (install only edits ${settingsPath}).`,
+      )
+  }
+  return out
+}
+
+const dropEmptyPermissions = (settings) => {
+  if (settings.permissions && Object.keys(settings.permissions).length === 0) delete settings.permissions
 }
 
 const install = (o) => {
   const settingsPath = resolve(o.settings ?? join(homedir(), '.claude', 'settings.json'))
-  const claudeDir = dirname(settingsPath)
-  const hookPath = join(claudeDir, 'hooks', HOOK_NAME)
-  const configPath = join(claudeDir, 'hooks', CONFIG_NAME)
+  const hooksDir = join(dirname(settingsPath), 'hooks')
+  const hookPath = join(hooksDir, HOOK_NAME)
+  const configPath = join(hooksDir, CONFIG_NAME)
   const previous = existsSync(configPath) ? readJson(configPath, 'hook config').value : {}
   const grantDirSpec = o.grantDir ?? previous.grantDir ?? DEFAULT_GRANT_DIR
   const grantDir = expandHome(grantDirSpec)
   const config = {
-    grantPhrases: o.grant.length ? o.grant : (previous.grantPhrases ?? ['publish-ok', 'allow publishing']),
     revokePhrases: o.revoke.length ? o.revoke : (previous.revokePhrases ?? ['publish-stop', 'stop publishing']),
     maxAgeSeconds: previous.maxAgeSeconds ?? 24 * 3600,
     grantDir: grantDirSpec,
@@ -199,24 +255,26 @@ const install = (o) => {
   addHooks(settings, hookPath, changes)
 
   settings.permissions ??= {}
-  const ask = Array.isArray(settings.permissions.ask) ? settings.permissions.ask : []
-  const askRemoved = ask.filter((r) => typeof r === 'string' && PUBLISH_ASK.test(r))
+  const ask = askRulesOf(settings)
+  const askRemoved = ask.filter((r) => PUBLISH_ASK.test(r))
   if (askRemoved.length) {
-    const keep = ask.filter((r) => !askRemoved.includes(r))
+    const keep = settings.permissions.ask.filter((r) => !askRemoved.includes(r))
     if (keep.length) settings.permissions.ask = keep
     else delete settings.permissions.ask
     changes.push(`removed permissions.ask: ${askRemoved.join(', ')}`)
   }
-  const broad = ask.filter((r) => typeof r === 'string' && BROAD_ASK.test(r) && !PUBLISH_ASK.test(r))
+  const broad = ask.filter((r) => BROAD_ASK.test(r) && !PUBLISH_ASK.test(r))
 
+  // Only Edit rules: a Write(path) deny rule is inert (the permissions reference matches file rules against the Edit tool
+  // family). The grant directory is denied to the agent, and so are the installed hook and its config.
   const deny = Array.isArray(settings.permissions.deny) ? settings.permissions.deny : []
-  const rules = ['Write', 'Edit'].map((tool) => `${tool}(${ruleDir(grantDir)}/**)`)
+  const rules = [`Edit(${ruleDir(grantDir)}/**)`, `Edit(${ruleDir(hooksDir)}/${HOOK_NAME.replace(/\.mjs$/, '')}*)`]
   const denyAdded = rules.filter((r) => !deny.includes(r))
   if (denyAdded.length) {
     settings.permissions.deny = [...deny, ...denyAdded]
     changes.push(`added permissions.deny: ${denyAdded.join(', ')}`)
   }
-  if (Object.keys(settings.permissions).length === 0) delete settings.permissions
+  dropEmptyPermissions(settings)
 
   // What uninstall reverses: accumulated across reruns, so a second install does not forget the first one's additions.
   config.installed = {
@@ -231,7 +289,7 @@ const install = (o) => {
   if (changes.length === 0) out.push('Settings already up to date; nothing to change.')
   else out.push(...changes.map((c) => `- ${c}`), '', `Diff of ${settingsPath}:`, diff)
   if (!o.dryRun) {
-    mkdirSync(dirname(hookPath), { recursive: true })
+    mkdirSync(hooksDir, { recursive: true })
     copyFileSync(HOOK_SOURCE, hookPath)
     chmodSync(hookPath, 0o644)
     writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`)
@@ -244,7 +302,10 @@ const install = (o) => {
     out.push(
       `Warning: permissions.ask also holds ${broad.join(', ')}. An ask rule beats a hook "allow", so it keeps prompting on publishDraft; remove it for the session grant to work.`,
     )
-  out.push(`Grant phrases: ${config.grantPhrases.join(', ')}. Revoke phrases: ${config.revokePhrases.join(', ')}. Grants: ${grantDir}`)
+  out.push(...projectAskWarnings(settingsPath))
+  out.push(
+    `Grant: the owner's Yes in the permission dialog for one publishDraft call. Revoke phrases: ${config.revokePhrases.join(', ')}. State: ${grantDir}`,
+  )
   return out.join('\n')
 }
 
@@ -260,6 +321,7 @@ const uninstall = (o) => {
   const settings = structuredClone(before.settings)
   const changes = []
   removeHooks(settings, changes)
+
   const added = Array.isArray(installed.deny) ? installed.deny : []
   const deny = Array.isArray(settings.permissions?.deny) ? settings.permissions.deny : []
   const gone = added.filter((r) => deny.includes(r))
@@ -267,9 +329,18 @@ const uninstall = (o) => {
     const keep = deny.filter((r) => !gone.includes(r))
     if (keep.length) settings.permissions.deny = keep
     else delete settings.permissions.deny
-    if (Object.keys(settings.permissions).length === 0) delete settings.permissions
     changes.push(`removed permissions.deny: ${gone.join(', ')}`)
   }
+  // Put back the per-call approval that install removed (deduplicated).
+  const removedAsk = Array.isArray(installed.askRemoved) ? installed.askRemoved.filter((r) => typeof r === 'string') : []
+  const ask = askRulesOf(settings)
+  const restore = removedAsk.filter((r) => !ask.includes(r))
+  if (restore.length) {
+    settings.permissions ??= {}
+    settings.permissions.ask = [...ask, ...restore]
+    changes.push(`restored permissions.ask: ${restore.join(', ')}`)
+  }
+  dropEmptyPermissions(settings)
 
   const out = []
   if (o.dryRun) out.push('Dry run: nothing was written.')
@@ -283,8 +354,6 @@ const uninstall = (o) => {
     if (backup) out.push(`Backup: ${backup}`)
     out.push(`Removed ${hookPath} and ${configPath}.`)
   }
-  if (Array.isArray(installed.askRemoved) && installed.askRemoved.length)
-    out.push(`Install removed these permissions.ask entries; put them back to approve each call again: ${installed.askRemoved.join(', ')}`)
   if (!hadRecord) out.push('No install record found; the deny rules were left alone.')
   return out.join('\n')
 }

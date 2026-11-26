@@ -1,32 +1,39 @@
 #!/usr/bin/env node
 /**
- * Claude Code hook: the owner approves `publishDraft` once per session instead of on every call.
+ * Claude Code hook: the owner approves `publishDraft` once per session, by saying Yes in the permission dialog.
  *
- * UserPromptSubmit: a prompt the human typed that contains a grant phrase writes a grant for this
- *   session; a revoke phrase deletes it. Only a human prompt reaches this event, so the agent cannot
- *   grant itself.
- * PreToolUse on `mcp__<server>__publishDraft`: a fresh grant for this session answers "allow", anything
- *   else answers "ask" (the owner is prompted, as an `ask` rule would have done).
+ * PreToolUse on `mcp__<server>__publishDraft`: a fresh grant for this session answers "allow". Otherwise the hook
+ *   records the call's `tool_use_id` as pending and answers "ask", so the owner gets the permission dialog.
+ * PostToolUse on the same tools: the call ran, so the owner said Yes in that dialog. Only if its `tool_use_id` is
+ *   the pending one this hook asked about, and the session was not in a mode where nobody answers
+ *   (bypassPermissions, dontAsk), the session is granted. (In `auto` mode the hook's "ask" still reaches the human.)
+ * UserPromptSubmit: a revoke phrase deletes the grant. A prompt never GRANTS: that event also fires for scheduled
+ *   tasks, /loop, a background subagent's report and messages from other sessions, so typed text is not proof of
+ *   the owner.
  *
- * Reads the hook event as JSON on stdin. Configuration, in order of precedence: the environment
- * (PUBLISH_GRANT_DIR, PUBLISH_GRANT_MAX_AGE in seconds, PUBLISH_GRANT_CONFIG for the config path), then the
- * sibling JSON file (`<this file without .mjs>.config.json`: grantPhrases, revokePhrases, maxAgeSeconds,
- * grantDir), then the defaults below. A config file that exists but is invalid throws: the registered
- * command turns a crash into a blocked PreToolUse call and an ignored UserPromptSubmit crash.
+ * Reads the hook event as JSON on stdin; unreadable input exits 1 (the registered command turns that into a block on
+ * PreToolUse and a no-op elsewhere). Configuration, in order of precedence: the environment (PUBLISH_GRANT_DIR,
+ * PUBLISH_GRANT_MAX_AGE in seconds, PUBLISH_GRANT_CONFIG for the config path), then the sibling JSON file
+ * (`<this file without .mjs>.config.json`: revokePhrases, maxAgeSeconds, grantDir), then the defaults below. A config
+ * file that exists but is invalid throws, which fails the same way.
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+/** The tool this hook guards; the installer builds its matcher and the ask-rule filter from it. */
+export const TOOL_NAME = 'publishDraft'
+const PUBLISH_TOOL = new RegExp(`^mcp__[A-Za-z0-9_-]+__${TOOL_NAME}$`)
+
 const DEFAULTS = {
-  grantPhrases: ['publish-ok', 'allow publishing'],
   revokePhrases: ['publish-stop', 'stop publishing'],
   maxAgeSeconds: 24 * 3600,
   grantDir: '~/.claude/state/publish-grants',
 }
 const SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/
-const PUBLISH_TOOL = /^mcp__[A-Za-z0-9_-]+__publishDraft$/
+const TOOL_USE_ID = /^[A-Za-z0-9_-]{1,200}$/
+const NOBODY_ANSWERS = new Set(['bypassPermissions', 'dontAsk'])
 
 const phraseList = (value, name) => {
   if (!Array.isArray(value) || value.length === 0 || value.some((p) => typeof p !== 'string' || p.trim() === ''))
@@ -47,67 +54,111 @@ const loadConfig = () => {
   const grantDir = process.env.PUBLISH_GRANT_DIR || merged.grantDir
   if (typeof grantDir !== 'string' || grantDir.trim() === '') throw new Error('grantDir must be a non-empty string')
   return {
-    grantPhrases: phraseList(merged.grantPhrases, 'grantPhrases'),
     revokePhrases: phraseList(merged.revokePhrases, 'revokePhrases'),
     maxAgeSeconds,
     grantDir: expandHome(grantDir),
     // The first phrase as the owner wrote it, for the message that names it.
-    grantHint: merged.grantPhrases[0],
+    revokeHint: merged.revokePhrases[0],
   }
 }
 
 const emit = (hookEventName, fields) => process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName, ...fields } })}\n`)
+
+/** A regular file (never a symlink) whose mtime is within (-60 s, maxAge). */
+const fresh = (path, maxAgeSeconds) => {
+  if (!path) return false
+  try {
+    const st = lstatSync(path)
+    const age = Date.now() - st.mtimeMs
+    return st.isFile() && age < maxAgeSeconds * 1000 && age > -60_000
+  } catch {
+    return false
+  }
+}
+
+/** Creates a private directory; an existing one is tightened to 0700. */
+const privateDir = (dir) => {
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  chmodSync(dir, 0o700)
+}
+
+/** Writes a new file, never through a symlink someone planted at the path. */
+const putFile = (path, content) => {
+  rmSync(path, { force: true })
+  writeFileSync(path, content, { flag: 'wx', mode: 0o600 })
+}
+
+const readPending = (path) => {
+  try {
+    if (!lstatSync(path).isFile()) return ''
+    return readFileSync(path, 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
 
 const main = () => {
   let ev
   try {
     ev = JSON.parse(readFileSync(0, 'utf8'))
   } catch {
-    return // unreadable input: change nothing, Claude Code's own rules apply
+    ev = null
   }
-  if (ev === null || typeof ev !== 'object') return
+  if (ev === null || typeof ev !== 'object' || Array.isArray(ev)) {
+    process.stderr.write('publish-grant hook: stdin is not a JSON object\n')
+    process.exitCode = 1
+    return
+  }
 
   const cfg = loadConfig()
   // A malformed id is never sanitised into a valid one: it could match another session's grant.
   const sid = typeof ev.session_id === 'string' && SESSION_ID.test(ev.session_id) ? ev.session_id : ''
-  const path = sid ? join(cfg.grantDir, sid) : ''
+  const grant = sid ? join(cfg.grantDir, sid) : ''
+  const pending = sid ? join(cfg.grantDir, 'pending', sid) : ''
 
-  if (ev.hook_event_name === 'UserPromptSubmit' && path) {
+  if (ev.hook_event_name === 'UserPromptSubmit') {
     const text = String(ev.prompt ?? '').toLowerCase()
-    if (cfg.revokePhrases.some((p) => text.includes(p))) {
-      rmSync(path, { force: true })
+    if (grant && cfg.revokePhrases.some((p) => text.includes(p))) {
+      rmSync(grant, { force: true })
+      rmSync(pending, { force: true })
       emit('UserPromptSubmit', {
-        additionalContext: 'Publishing grant for this session REVOKED by the owner: publishDraft asks for approval again.',
-      })
-    } else if (cfg.grantPhrases.some((p) => text.includes(p))) {
-      mkdirSync(cfg.grantDir, { recursive: true, mode: 0o700 })
-      writeFileSync(path, String(Math.floor(Date.now() / 1000)), { mode: 0o600 })
-      const hours = Math.round((cfg.maxAgeSeconds / 3600) * 10) / 10
-      emit('UserPromptSubmit', {
-        additionalContext: `The owner granted publishing for this session: publishDraft runs without a prompt until the session ends (${hours} h at most). The dry run, the digest and showing the owner the content first still apply.`,
+        additionalContext: 'Publishing grant for this session REVOKED by the owner: the next publishDraft asks again.',
       })
     }
     return
   }
 
-  if (ev.hook_event_name === 'PreToolUse' && PUBLISH_TOOL.test(String(ev.tool_name ?? ''))) {
-    let fresh = false
-    if (path) {
-      try {
-        const st = statSync(path)
-        const age = Date.now() - st.mtimeMs
-        fresh = st.isFile() && age < cfg.maxAgeSeconds * 1000 && age > -60_000
-      } catch {
-        fresh = false
-      }
+  if (!PUBLISH_TOOL.test(String(ev.tool_name ?? ''))) return
+  const tuid = typeof ev.tool_use_id === 'string' && TOOL_USE_ID.test(ev.tool_use_id) ? ev.tool_use_id : ''
+
+  if (ev.hook_event_name === 'PreToolUse') {
+    if (fresh(grant, cfg.maxAgeSeconds)) {
+      emit('PreToolUse', { permissionDecision: 'allow', permissionDecisionReason: 'the owner approved publishing for this session' })
+      return
     }
-    if (fresh) emit('PreToolUse', { permissionDecision: 'allow', permissionDecisionReason: 'owner granted publishing for this session' })
-    else
-      emit('PreToolUse', {
-        permissionDecision: 'ask',
-        permissionDecisionReason: `Publishing needs your OK. To allow it for the whole session, write "${cfg.grantHint}".`,
-      })
+    if (pending && tuid) {
+      privateDir(join(cfg.grantDir, 'pending'))
+      putFile(pending, tuid)
+    }
+    const hours = Math.round((cfg.maxAgeSeconds / 3600) * 10) / 10
+    emit('PreToolUse', {
+      permissionDecision: 'ask',
+      permissionDecisionReason: `Approving this ${TOOL_NAME} call approves ${TOOL_NAME} for the rest of this session (${hours} h max). "${cfg.revokeHint}" revokes.`,
+    })
+    return
+  }
+
+  if (ev.hook_event_name === 'PostToolUse') {
+    if (!pending || !tuid || NOBODY_ANSWERS.has(ev.permission_mode)) return
+    if (readPending(pending) !== tuid) return
+    rmSync(pending, { force: true })
+    privateDir(cfg.grantDir)
+    putFile(grant, '')
+    emit('PostToolUse', {
+      additionalContext: `The owner approved ${TOOL_NAME} in the permission dialog: publishing is approved for the rest of this session (${Math.round((cfg.maxAgeSeconds / 3600) * 10) / 10} h max). Showing the owner the content first still applies.`,
+    })
   }
 }
 
-main()
+// Run only as a script: the installer imports TOOL_NAME from this file.
+if (process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url))) main()

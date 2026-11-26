@@ -8,8 +8,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 /**
  * `payload-mcp-publish claude-hook install|uninstall` on a temp HOME.
  * Mutations: bin removing the ask filter -> "removes only the publishDraft ask rules" red; skipping the deny rules ->
- * "adds deny rules" red; a hook command without `|| exit 2` on PreToolUse -> "fails closed" red; uninstall deleting
- * deny rules it did not add -> "uninstall keeps a deny rule that was already there" red.
+ * "adds deny rules" red; a PreToolUse command without `|| exit 2` -> "fails closed" red; uninstall deleting deny rules it
+ * did not add -> "uninstall keeps a deny rule that was already there" red; uninstall not restoring the ask rules ->
+ * "reverses what install added" and "restores the ask rules" red; PostToolUse not registered -> "registers" and
+ * "end to end" red.
  */
 const PATH = `${dirname(process.execPath)}:${process.env.PATH ?? ''}` // the node running the tests, not a version-manager shim
 const BIN = fileURLToPath(new URL('../bin/payload-mcp-publish.mjs', import.meta.url))
@@ -23,13 +25,19 @@ beforeEach(() => {
 })
 afterEach(() => rmSync(home, { recursive: true, force: true }))
 
-const cli = (...args: string[]) => {
-  const r = spawnSync(process.execPath, [BIN, 'claude-hook', ...args], { env: { NODE_ENV: 'test', PATH, HOME: home }, encoding: 'utf8' })
+const cli = (args: string[], cwd?: string) => {
+  const r = spawnSync(process.execPath, [BIN, 'claude-hook', ...args], {
+    env: { NODE_ENV: 'test', PATH, HOME: home },
+    encoding: 'utf8',
+    cwd,
+  })
   return { status: r.status, out: r.stdout, err: r.stderr }
 }
-const install = (...a: string[]) => cli('install', ...a)
+const install = (...a: string[]) => cli(['install', ...a])
+const uninstall = (...a: string[]) => cli(['uninstall', ...a])
 const read = () => JSON.parse(readFileSync(settings, 'utf8'))
-const hookPath = () => join(home, '.claude', 'hooks', 'payload-mcp-publish-grant.mjs')
+const hooksDir = () => join(home, '.claude', 'hooks')
+const hookPath = () => join(hooksDir(), 'payload-mcp-publish-grant.mjs')
 const baks = () => readdirSync(join(home, '.claude')).filter((f) => f.startsWith('settings.json.bak-'))
 
 const original = {
@@ -46,17 +54,22 @@ const original = {
   },
 }
 const seed = (value: unknown = original, indent: string | number = 4) => writeFileSync(settings, `${JSON.stringify(value, null, indent)}\n`)
+const DENY = ['Edit(~/.claude/state/publish-grants/**)', 'Edit(~/.claude/hooks/payload-mcp-publish-grant*)']
 
 describe('claude-hook install', () => {
-  it('registers both hooks, with fail-open prompt and fail-closed PreToolUse commands', () => {
+  it('registers the three hooks; PreToolUse fails closed, the others fail open', () => {
     seed()
     const r = install()
     expect(r.status).toBe(0)
     const s = read()
-    expect(s.hooks.UserPromptSubmit).toEqual([{ hooks: [{ type: 'command', command: `node "${hookPath()}" || exit 0` }] }])
-    const pre = s.hooks.PreToolUse
-    expect(pre[0]).toEqual(original.hooks.PreToolUse[0]) // the user's own hook is untouched and first
-    expect(pre[1]).toEqual({ matcher: 'mcp__.*__publishDraft', hooks: [{ type: 'command', command: `node "${hookPath()}" || exit 2` }] })
+    const cmd = (code: number) => `node "${hookPath()}" || exit ${code}`
+    expect(s.hooks.UserPromptSubmit).toEqual([{ hooks: [{ type: 'command', command: cmd(0) }] }])
+    expect(s.hooks.PreToolUse[0]).toEqual(original.hooks.PreToolUse[0]) // the user's own hook is untouched and first
+    expect(s.hooks.PreToolUse[1]).toEqual({
+      matcher: 'mcp__.*__publishDraft',
+      hooks: [{ type: 'command', command: cmd(2), onFailure: 'block' }],
+    })
+    expect(s.hooks.PostToolUse).toEqual([{ matcher: 'mcp__.*__publishDraft', hooks: [{ type: 'command', command: cmd(0) }] }])
     expect(existsSync(hookPath())).toBe(true)
   })
 
@@ -68,11 +81,11 @@ describe('claude-hook install', () => {
     expect(r.out).toContain('mcp__site-b__publishDraft')
   })
 
-  it('adds deny rules for the grant directory', () => {
+  it('adds Edit deny rules for the grant directory and the installed hook; no inert Write rules', () => {
     seed()
     install()
-    const deny = read().permissions.deny
-    expect(deny).toEqual(['Read(./.env)', 'Write(~/.claude/state/publish-grants/**)', 'Edit(~/.claude/state/publish-grants/**)'])
+    expect(read().permissions.deny).toEqual(['Read(./.env)', ...DENY])
+    expect(JSON.stringify(read())).not.toContain('Write(')
   })
 
   it('keeps every unrelated key and the file indentation', () => {
@@ -88,12 +101,13 @@ describe('claude-hook install', () => {
     expect(raw.endsWith('\n')).toBe(true)
   })
 
-  it('writes a backup of the previous settings, and none when nothing changes', () => {
+  it('writes a backup of the previous settings, leaves no temp file, and writes no backup when nothing changes', () => {
     seed()
     install()
     const b = baks()
     expect(b).toHaveLength(1)
     expect(JSON.parse(readFileSync(join(home, '.claude', b[0]), 'utf8'))).toEqual(original)
+    expect(readdirSync(join(home, '.claude')).filter((f) => f.includes('.tmp-'))).toEqual([])
     install()
     expect(baks()).toHaveLength(1)
   })
@@ -108,6 +122,7 @@ describe('claude-hook install', () => {
     const s = read()
     expect(s.hooks.UserPromptSubmit).toHaveLength(1)
     expect(s.hooks.PreToolUse).toHaveLength(2)
+    expect(s.hooks.PostToolUse).toHaveLength(1)
     expect(s.permissions.deny).toHaveLength(3)
   })
 
@@ -129,20 +144,23 @@ describe('claude-hook install', () => {
     expect(baks()).toHaveLength(0)
   })
 
-  it('--grant/--revoke phrases land in the config, and a rerun without flags keeps them', () => {
+  it('--revoke phrases land in the config, a rerun without flags keeps them, and there is no grant phrase', () => {
     seed()
-    install('--grant', 'разрешаю публикацию', '--grant', 'go live', '--revoke', 'запрещаю публикацию')
-    const cfgPath = join(home, '.claude', 'hooks', 'payload-mcp-publish-grant.config.json')
+    install('--revoke', 'запрещаю публикацию', '--revoke', 'pull the plug')
+    const cfgPath = join(hooksDir(), 'payload-mcp-publish-grant.config.json')
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
-    expect(cfg.grantPhrases).toEqual(['разрешаю публикацию', 'go live'])
-    expect(cfg.revokePhrases).toEqual(['запрещаю публикацию'])
+    expect(cfg.revokePhrases).toEqual(['запрещаю публикацию', 'pull the plug'])
+    expect(cfg).not.toHaveProperty('grantPhrases')
     install()
-    expect(JSON.parse(readFileSync(cfgPath, 'utf8')).grantPhrases).toEqual(['разрешаю публикацию', 'go live'])
+    expect(JSON.parse(readFileSync(cfgPath, 'utf8')).revokePhrases).toEqual(['запрещаю публикацию', 'pull the plug'])
+    const r = install('--grant', 'publish-ok')
+    expect(r.status).toBe(1)
+    expect(r.err).toContain('--grant is gone')
   })
 
   it('refuses a blank phrase and an unparseable settings file, changing nothing', () => {
     seed()
-    expect(install('--grant', '  ').status).toBe(1)
+    expect(install('--revoke', '  ').status).toBe(1)
     writeFileSync(settings, '{ nope')
     const r = install()
     expect(r.status).toBe(1)
@@ -158,75 +176,111 @@ describe('claude-hook install', () => {
     expect(r.out).toContain('Warning')
   })
 
-  it('the installed hook works end to end through the registered command', () => {
+  it('warns when project settings in the working directory hold publishDraft ask rules', () => {
     seed()
-    install()
-    const s = read()
-    const run = (event: 'UserPromptSubmit' | 'PreToolUse', input: object, extraEnv: Record<string, string> = {}) => {
-      const command = event === 'PreToolUse' ? s.hooks.PreToolUse[1].hooks[0].command : s.hooks.UserPromptSubmit[0].hooks[0].command
-      return spawnSync('sh', ['-c', command], {
-        input: JSON.stringify({ hook_event_name: event, session_id: 'E2E', ...input }),
-        env: { NODE_ENV: 'test', PATH, HOME: home, ...extraEnv },
-        encoding: 'utf8',
-      })
-    }
-    const tool = { tool_name: 'mcp__site-a__publishDraft' }
-    expect(JSON.parse(run('PreToolUse', tool).stdout).hookSpecificOutput.permissionDecision).toBe('ask')
-    run('UserPromptSubmit', { prompt: 'publish-ok' })
-    expect(JSON.parse(run('PreToolUse', tool).stdout).hookSpecificOutput.permissionDecision).toBe('allow')
-    expect(existsSync(join(home, '.claude', 'state', 'publish-grants', 'E2E'))).toBe(true)
+    const project = join(home, 'project')
+    mkdirSync(join(project, '.claude'), { recursive: true })
+    writeFileSync(join(project, '.claude', 'settings.local.json'), JSON.stringify({ permissions: { ask: ['mcp__site-c__publishDraft'] } }))
+    const r = cli(['install'], project)
+    expect(r.out).toContain('settings.local.json')
+    expect(r.out).toContain('mcp__site-c__publishDraft')
+    expect(cli(['install'], home).out).not.toContain('settings.local.json')
   })
 
-  it('fails closed on PreToolUse and open on UserPromptSubmit when the hook crashes', () => {
+  it('the installed hook completes the dialog flow through the registered commands (ask, Yes, allow)', () => {
     seed()
     install()
-    writeFileSync(join(home, '.claude', 'hooks', 'payload-mcp-publish-grant.config.json'), '{broken')
     const s = read()
-    const exec = (command: string, event: string) =>
+    const exec = (command: string, input: object) =>
       spawnSync('sh', ['-c', command], {
-        input: JSON.stringify({ hook_event_name: event, session_id: 'X', tool_name: 'mcp__site-a__publishDraft', prompt: 'publish-ok' }),
+        input: JSON.stringify({
+          session_id: 'E2E',
+          tool_name: 'mcp__site-a__publishDraft',
+          tool_use_id: 'tu1',
+          permission_mode: 'default',
+          ...input,
+        }),
         env: { NODE_ENV: 'test', PATH, HOME: home },
         encoding: 'utf8',
       })
-    expect(exec(s.hooks.PreToolUse[1].hooks[0].command, 'PreToolUse').status).toBe(2)
-    expect(exec(s.hooks.UserPromptSubmit[0].hooks[0].command, 'UserPromptSubmit').status).toBe(0)
+    const preCmd = s.hooks.PreToolUse[1].hooks[0].command
+    const postCmd = s.hooks.PostToolUse[0].hooks[0].command
+    const decision = (id: string) =>
+      JSON.parse(exec(preCmd, { hook_event_name: 'PreToolUse', tool_use_id: id }).stdout).hookSpecificOutput.permissionDecision
+    expect(decision('tu1')).toBe('ask')
+    expect(exec(postCmd, { hook_event_name: 'PostToolUse', tool_use_id: 'tu1' }).stdout).toContain('approved publishDraft')
+    expect(existsSync(join(home, '.claude', 'state', 'publish-grants', 'E2E'))).toBe(true)
+    expect(decision('tu2')).toBe('allow')
+  })
+
+  it('fails closed on PreToolUse and open elsewhere when the hook crashes or gets unreadable input', () => {
+    seed()
+    install()
+    const s = read()
+    const exec = (command: string, input: string) =>
+      spawnSync('sh', ['-c', command], { input, env: { NODE_ENV: 'test', PATH, HOME: home }, encoding: 'utf8' })
+    const pre = s.hooks.PreToolUse[1].hooks[0].command
+    const others = [s.hooks.UserPromptSubmit[0].hooks[0].command, s.hooks.PostToolUse[0].hooks[0].command]
+    // unreadable stdin: the hook exits 1
+    expect(exec(pre, 'not json').status).toBe(2)
+    for (const c of others) expect(exec(c, 'not json').status).toBe(0)
+    // a broken config: the hook throws
+    writeFileSync(join(hooksDir(), 'payload-mcp-publish-grant.config.json'), '{broken')
+    const event = JSON.stringify({
+      hook_event_name: 'PreToolUse',
+      session_id: 'X',
+      tool_name: 'mcp__site-a__publishDraft',
+      tool_use_id: 'tu1',
+    })
+    expect(exec(pre, event).status).toBe(2)
+    for (const c of others) expect(exec(c, event).status).toBe(0)
   })
 })
 
 describe('claude-hook uninstall', () => {
-  it('reverses what install added and prints the removed ask rules', () => {
+  it('reverses what install added and restores the ask rules install removed', () => {
     seed()
     install()
-    const r = cli('uninstall')
+    const r = uninstall()
     expect(r.status).toBe(0)
     const s = read()
     expect(s.hooks).toEqual(original.hooks)
     expect(s.permissions.deny).toEqual(['Read(./.env)'])
     expect(s.permissions.allow).toEqual(original.permissions.allow)
-    expect(s.permissions.ask).toEqual(['mcp__site-a__updateParts', 'Bash(git push:*)']) // not restored, only printed
-    expect(r.out).toContain('mcp__site-a__publishDraft')
+    expect([...s.permissions.ask].sort()).toEqual([...original.permissions.ask].sort())
+    expect(r.out).toContain('restored permissions.ask')
     expect(existsSync(hookPath())).toBe(false)
+  })
+
+  it('restores the ask rules when install left no ask list at all, without duplicates on a second uninstall', () => {
+    seed({ permissions: { ask: ['mcp__site-a__publishDraft'] } })
+    install()
+    expect(read().permissions.ask).toBeUndefined()
+    uninstall()
+    expect(read()).toEqual({ permissions: { ask: ['mcp__site-a__publishDraft'] } })
+    uninstall()
+    expect(read()).toEqual({ permissions: { ask: ['mcp__site-a__publishDraft'] } })
   })
 
   it('restores a settings file that had none of these keys to an empty object', () => {
     install()
-    cli('uninstall')
+    uninstall()
     expect(read()).toEqual({})
   })
 
   it('uninstall keeps a deny rule that was already there before install', () => {
-    seed({ permissions: { deny: ['Write(~/.claude/state/publish-grants/**)'] } })
+    seed({ permissions: { deny: [DENY[0]] } })
     install()
     install() // a rerun must not forget the first run's record
-    cli('uninstall')
-    expect(read().permissions.deny).toEqual(['Write(~/.claude/state/publish-grants/**)'])
+    uninstall()
+    expect(read().permissions.deny).toEqual([DENY[0]])
   })
 
   it('uninstall --dry-run writes nothing', () => {
     seed()
     install()
     const before = readFileSync(settings, 'utf8')
-    cli('uninstall', '--dry-run')
+    uninstall('--dry-run')
     expect(readFileSync(settings, 'utf8')).toBe(before)
     expect(existsSync(hookPath())).toBe(true)
   })
