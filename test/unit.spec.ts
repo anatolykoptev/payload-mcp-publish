@@ -1,7 +1,7 @@
 import type { CollectionConfig, PayloadRequest } from 'payload'
 import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
-import { diffSummary, lexicalText, mcpPublishLane } from '../src/index.js'
+import { diffSummary, hideOwnerUnpublishedFromMcp, lexicalText, mcpPublishLane, publishPin } from '../src/index.js'
 import { offByDefault } from '../src/lane.js'
 
 /**
@@ -54,6 +54,23 @@ describe('mcpPublishLane', () => {
 
   it('refuses an empty lane', () => {
     expect(() => mcpPublishLane({ collections: [] })).toThrow(/at least one collection/)
+  })
+
+  it('keeps the legacy pin and read helper on a plain lane, and makes adapter closures on a retirement lane', () => {
+    const plain = mcpPublishLane({ collections: ['posts'] })
+    expect(plain.publishPin).toBe(publishPin)
+    expect(plain.hideOwnerUnpublishedFromMcp).toBe(hideOwnerUnpublishedFromMcp)
+
+    const retirement = { isRetired: async () => false, retiredIds: async () => [] }
+    const durable = mcpPublishLane({ collections: ['posts'], retirement })
+    expect(durable.publishPin).not.toBe(publishPin)
+    expect(durable.hideOwnerUnpublishedFromMcp).not.toBe(hideOwnerUnpublishedFromMcp)
+  })
+
+  it('refuses a partial retirement adapter', () => {
+    expect(() => mcpPublishLane({ collections: ['posts'], retirement: { isRetired: async () => false } as never })).toThrow(
+      /isRetired.*retiredIds/,
+    )
   })
 
   it('overrideAuth stashes the resolved access on the request and returns it', async () => {

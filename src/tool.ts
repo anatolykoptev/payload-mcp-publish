@@ -1,12 +1,13 @@
-import type { PayloadRequest } from 'payload'
+import type { CollectionBeforeChangeHook, PayloadRequest } from 'payload'
 import { APIError, NotFound } from 'payload'
 import { z } from 'zod'
 import { camel } from './camel.js'
 import { contentDigest, diffSummary, isEmptyValue, mismatches } from './diff.js'
-import { standingOf } from './ownerUnpublished.js'
+import { inferredRetirement, type RetirementAdapter } from './ownerUnpublished.js'
 import { wiringProblem } from './wiring.js'
 
 type Doc = Record<string, unknown>
+type Pin = CollectionBeforeChangeHook
 
 /** What a publish gate sees. */
 export type GateContext = {
@@ -38,6 +39,8 @@ export type PublishGate = {
 export type PublishToolOptions = {
   collections: readonly string[]
   gate?: PublishGate
+  /** The source of truth for documents the owner retired. Without one, version-history inference is the fallback. */
+  retirement?: RetirementAdapter
   /** The public URL of a published document, for the tool's answer. Without it the answer carries no link. */
   urlFor?: (collection: string, doc: Doc) => string | undefined
 }
@@ -54,7 +57,7 @@ const refuse = (message: string): never => {
  *    on any difference, and the update itself re-checks the draft it builds on (`publishPin`, inside the
  *    transaction), so a save between the check and the write loses.
  */
-export const makePublishDraft = (o: PublishToolOptions) => async (args: Record<string, unknown>, req: PayloadRequest) => {
+export const makePublishDraft = (o: PublishToolOptions, pin?: Pin) => async (args: Record<string, unknown>, req: PayloadRequest) => {
   const { payload, user } = req
   if (!user) return refuse('Not authenticated.')
 
@@ -63,7 +66,7 @@ export const makePublishDraft = (o: PublishToolOptions) => async (args: Record<s
     return refuse(`\`${collection}\` cannot be published from here. Allowed: ${o.collections.join(', ')}.`)
   }
   const slug = collection as never
-  const unwired = wiringProblem(payload, collection)
+  const unwired = wiringProblem(payload, collection, pin)
   if (unwired) return refuse(unwired)
   // The key must be allowed to edit this collection, not only to publish.
   const access = (req.context as { mcpAccess?: Record<string, { update?: boolean } | undefined> } | undefined)?.mcpAccess
@@ -98,8 +101,8 @@ export const makePublishDraft = (o: PublishToolOptions) => async (args: Record<s
   const liveRow = await read(false)
   const live = liveRow?._status === 'published' ? liveRow : undefined
   if (!live) {
-    const standing = await standingOf(payload, slug, id)
-    if (standing === 'retired') return refuse(`${name} was unpublished by the owner; republish in the admin.`)
+    const retired = await (o.retirement ?? inferredRetirement).isRetired(payload, slug, id, req)
+    if (retired) return refuse(`${name} was unpublished by the owner; republish in the admin.`)
   }
 
   const verdict = await o.gate?.check({ args, collection, draft: latest, live, req })

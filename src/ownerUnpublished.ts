@@ -3,15 +3,26 @@ import { NotFound } from 'payload'
 
 /**
  * Has the owner taken a document down? Payload keeps no record: a never-published and an unpublished document both have
- * a draft live row, and the only evidence is the version history. A document whose live row is not published is
+ * a draft live row. Without a durable marker the only evidence is the version history. A document whose live row is not
+ * published is
  * - `retired` when a published version is in its history;
  * - `never` otherwise.
  *
- * The history is pruned (`versions.maxPerDoc`, oldest first), and once it has lost the published version the guard cannot
- * tell. Retired documents are best deleted: delete what you retire. Until then the lane refuses every MCP update of a
- * `retired` document, so an agent cannot push the evidence out by saving drafts.
+ * The history is pruned (`versions.maxPerDoc`, oldest first), and once it has lost the published version this inference
+ * cannot tell. It is the fallback for a lane without a `retirement` adapter; an adapter such as `durableRetirement`
+ * keeps the decision on the document itself.
  */
 export type Standing = 'live' | 'never' | 'retired'
+
+/**
+ * The lane's source of truth for owner-retired documents. Both sides are required because the guards need both shapes:
+ * `publishDraft` and `publishPin` ask about one document, read access asks for the collection. Implementations must be
+ * durable under version pruning; the lane falls back to version-history inference when no adapter is configured.
+ */
+export type RetirementAdapter = {
+  isRetired: (payload: Payload, collection: CollectionSlug, id: number | string, req?: PayloadRequest) => Promise<boolean>
+  retiredIds: (payload: Payload, collection: CollectionSlug, req?: PayloadRequest) => Promise<(number | string)[]>
+}
 
 type Version = { published: boolean }
 
@@ -59,10 +70,14 @@ export const standingOf = async (
 }
 
 /**
- * Ids of the documents of a collection that the owner took down (`retired`, see `Standing`).
- * One query for the drafts and one for their versions.
+ * Ids of the documents of a collection that the owner took down (`retired`, see `Standing`), inferred from version
+ * history. One query for the drafts and one for their versions.
  */
-export const ownerUnpublishedIds = async (payload: Payload, collection: CollectionSlug): Promise<(number | string)[]> => {
+export const ownerUnpublishedIds = async (
+  payload: Payload,
+  collection: CollectionSlug,
+  req?: PayloadRequest,
+): Promise<(number | string)[]> => {
   // Same test as `standingOf`: a live row that is not published (a null status included).
   const notLive = await payload.find({
     collection,
@@ -73,6 +88,7 @@ export const ownerUnpublishedIds = async (payload: Payload, collection: Collecti
     pagination: false,
     select: {},
     where: { _status: { not_equals: 'published' } },
+    ...(req ? { req } : {}),
   })
   if (!notLive.docs.length) return []
   // Only the published versions of those documents: a handful of rows, one `parent` each.
@@ -84,6 +100,13 @@ export const ownerUnpublishedIds = async (payload: Payload, collection: Collecti
     pagination: false,
     select: { parent: true } as never,
     where: { and: [{ parent: { in: notLive.docs.map((d) => d.id) } }, { 'version._status': { equals: 'published' } }] },
+    ...(req ? { req } : {}),
   })
   return [...new Set(docs.map((v) => (v as unknown as { parent: number | string }).parent))]
+}
+
+/** The pre-adapter guard: version-history inference. Kept as the fallback when a lane has no `retirement` adapter. */
+export const inferredRetirement: RetirementAdapter = {
+  isRetired: async (payload, collection, id, req) => (await standingOf(payload, collection, id, req)) === 'retired',
+  retiredIds: (payload, collection, req) => ownerUnpublishedIds(payload, collection, req),
 }

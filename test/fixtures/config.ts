@@ -5,7 +5,7 @@ import { mcpPlugin } from '@payloadcms/plugin-mcp'
 import { lexicalEditor } from '@payloadcms/richtext-lexical'
 import { buildConfig, type CollectionConfig } from 'payload'
 import { z } from 'zod'
-import { hideOwnerUnpublishedFromMcp, mcpPublishLane } from '../../src/index.js'
+import { durableRetirement, mcpPublishLane, retiredField, trackRetirement } from '../../src/index.js'
 import { draftOnly } from './draftOnly.js'
 
 const dir = path.resolve(process.cwd(), 'test/.tmp')
@@ -55,6 +55,7 @@ const gate = {
 export const lane = mcpPublishLane({
   collections: ['posts', 'case-studies', 'unwired'],
   gate,
+  retirement: durableRetirement,
   urlFor: (collection, doc) => `https://example.test/${collection}/${String(doc.slug)}`,
 })
 
@@ -66,13 +67,14 @@ const hooks = {
 const posts: CollectionConfig = {
   slug: 'posts',
   access: { read: readLatest },
-  hooks,
+  hooks: { ...hooks, afterChange: [trackRetirement] },
   versions: { drafts: true },
   fields: [
     { name: 'title', type: 'text', required: true },
     { name: 'slug', type: 'text' },
     { name: 'blurb', type: 'textarea' },
     { name: 'body', type: 'richText' },
+    retiredField(),
     {
       name: 'sections',
       type: 'array',
@@ -88,13 +90,14 @@ const posts: CollectionConfig = {
 // that hides what the owner took down from an MCP key.
 const caseStudies: CollectionConfig = {
   slug: 'case-studies',
-  access: { read: hideOwnerUnpublishedFromMcp('case-studies', readLatest as never) },
-  hooks,
+  access: { read: lane.hideOwnerUnpublishedFromMcp('case-studies', readLatest as never) },
+  hooks: { ...hooks, afterChange: [trackRetirement] },
   versions: { drafts: true, maxPerDoc: 3 },
   fields: [
     { name: 'title', type: 'text', required: true },
     { name: 'slug', type: 'text' },
     { name: 'summary', type: 'textarea' },
+    retiredField(),
     {
       name: 'verification',
       type: 'group',

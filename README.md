@@ -18,12 +18,13 @@ No code change, no deploy.
 - **The key's own scope.** The tool is unticked on every key (the plugin registers custom tools ticked), and a key also needs
   its own `update` box for the collection: the tool never widens a key.
 - **A collection allowlist.** Only the collections you list can publish from here.
-- **What the owner took down stays down while its published version is in the history.** Payload keeps no record that the owner unpublished a document: a never-published
-  and an unpublished document both have a draft live row, and the only evidence is the version history. A document whose live
-  row is not published and that has a published version in its history is `retired`: `publishDraft` refuses it, **every MCP
-  update of it is refused** (so an agent cannot push the evidence out by saving drafts), and `hideOwnerUnpublishedFromMcp`
-  hides it from MCP reads. The owner republishes or edits it in the admin. The history is pruned (`versions.maxPerDoc`), and
-  once it has lost the published version the guard cannot tell: **retired documents are best deleted. Delete what you retire.**
+- **What the owner took down stays down.** Payload keeps no record that the owner unpublished a document: a never-published
+  and an unpublished document both have a draft live row. A lane can be given a durable `retirement` adapter; `publishDraft`
+  then refuses a retired document, **every MCP update of it is refused** (so an agent cannot push the evidence out by saving
+  drafts), and `lane.hideOwnerUnpublishedFromMcp` hides it from MCP reads. The owner republishes or edits it in the admin.
+  Without an adapter the lane keeps the old fallback: it infers retirement from a published version in the history. That
+  history is pruned (`versions.maxPerDoc`), so sites that cap versions should opt into `durableRetirement` below. Even with
+  it, **retired documents are best deleted. Delete what you retire.**
 - **An MCP write never publishes.** `publishPin` refuses any MCP create or update whose data says `_status: 'published'`,
   whatever the site's draft-only hook does, so the stock update tool is not a second publish path.
 - **A half-wired lane refuses.** Each call checks that the collection has drafts and carries `lane.publishPin`, and refuses
@@ -102,14 +103,66 @@ mcpPublishLane({
 arguments (they may not be named `collection`, `id`, `digest` or `dryRun`). The data is printed in full in the dry run, may
 only fill fields the draft leaves empty, and can never set `_status` or a system field.
 
-### Hide retired documents from MCP reads
+### Durable retirement, and hiding retired documents from MCP reads
+
+Without a `retirement` adapter the lane keeps its previous behaviour: a document whose live row is not published is retired
+when a published version is still in its version history. If `versions.maxPerDoc` prunes that version, the evidence is gone.
+Sites that cap versions can make the decision durable on the document itself:
 
 ```ts
-import { hideOwnerUnpublishedFromMcp } from 'payload-mcp-publish'
-access: {
-  read: hideOwnerUnpublishedFromMcp('services', yourReadAccess)
+import { durableRetirement, mcpPublishLane, retiredField, trackRetirement } from 'payload-mcp-publish'
+
+export const lane = mcpPublishLane({
+  collections: ['services'],
+  retirement: durableRetirement,
+})
+```
+
+On **every** collection the lane lists, add the field and both hooks, and use the lane's own read helper:
+
+```ts
+access: { read: lane.hideOwnerUnpublishedFromMcp('services', yourReadAccess) },
+hooks: {
+  beforeChange: [lane.publishPin],
+  afterChange: [trackRetirement],
+},
+fields: [
+  retiredField(),
+  // ...your fields
+],
+```
+
+`retiredField()` adds a hidden `retired` checkbox owned by the lane. Normal writes cannot set it. `trackRetirement` sets it
+when a published document becomes unpublished and clears it when the document is published again; the write is inside the
+same transaction, does not create a version, and survives `maxPerDoc` pruning. Generate a migration for the new field.
+
+The hook records retirements that happen after it is installed. Backfill documents already retired while their published
+history is still present:
+
+```ts
+import { ownerUnpublishedIds } from 'payload-mcp-publish'
+
+for (const collection of ['services'] as const) {
+  for (const id of await ownerUnpublishedIds(payload, collection)) {
+    await payload.db.updateOne({ collection, data: { retired: true }, id })
+  }
 }
 ```
+
+A document whose published history was already pruned cannot be found this way; mark those ids explicitly or delete them.
+If a collection is missing `retiredField()`, `durableRetirement` fails loudly instead of falling back open.
+
+A custom adapter is one object and both methods are required; the three guards then share that one source of truth:
+
+```ts
+type RetirementAdapter = {
+  isRetired: (payload, collection, id, req) => Promise<boolean>
+  retiredIds: (payload, collection, req) => Promise<(number | string)[]>
+}
+```
+
+The fixed exports `publishPin` and `hideOwnerUnpublishedFromMcp` still use the version-history fallback for existing
+installations. With an adapter, wire `lane.publishPin` and `lane.hideOwnerUnpublishedFromMcp` instead.
 
 ## Owner approval in Claude Code
 

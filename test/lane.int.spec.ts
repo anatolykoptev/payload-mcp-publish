@@ -4,9 +4,10 @@ import { rmSync } from 'node:fs'
 import { REST_POST } from '@payloadcms/next/routes'
 import { getPayload, type Payload, type PayloadRequest } from 'payload'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { hideOwnerUnpublishedFromMcp, standingOf } from '../src/index.js'
 import { publishPin } from '../src/pin.js'
 import { makePublishDraft } from '../src/tool.js'
-import makeConfig from './fixtures/config.js'
+import makeConfig, { lane } from './fixtures/config.js'
 
 /**
  * The publish lane, driven through Payload's real REST handler with real API keys (`POST /api/mcp`),
@@ -25,8 +26,11 @@ import makeConfig from './fixtures/config.js'
  * - src/tool.ts `...as` -> `req` in the update (the site's draft-only hook re-drafts it): every publish case.
  * - src/pin.ts the `pin` comparison: "the update itself refuses a draft that moved after the check".
  * - src/pin.ts the MCP-update guard: "an MCP update of a document the owner took down is refused" and "the
- *   owner-unpublished guard survives a pruned version history" (the version history is pruned).
- * - src/tool.ts the `standing === .retired.` refusal: "is not republished from here".
+ *   lane pin refuses an MCP update of a durably retired document after pruning".
+ * - src/tool.ts the retirement refusal (or its adapter): "is not republished from here" and "publishDraft refuses
+ *   a durably retired document after pruning".
+ * - src/access.ts the adapter's `retiredIds` not used: "MCP reads hide a durably retired document after pruning".
+ * - src/retirement.ts the pre-write capture or the marker write: the two "records retirement" cases.
  * - src/lane.ts `'publishDraft'` out of the off-by-default names: "a key without the box ticked has no publishDraft".
  * - src/tool.ts the catch made a catch-all (`return null` for every error): "only a missing document is not found".
  * - src/diff.ts `diffSummary` cutting text at 400 characters, or counting array rows: the "full text" cases.
@@ -109,7 +113,7 @@ describe('the publish lane over MCP', () => {
   const failed = (body: Rpc) => Boolean(body.error ?? body.result?.isError)
   const publish = (args: Record<string, unknown>, apiKey = secrets.all) => call(apiKey, 'publishDraft', args)
   const status = async (collection: 'posts' | 'case-studies' | 'notes' | 'raw' | 'unwired', id: number | string, draft: boolean) =>
-    (await payload.findByID({ collection, depth: 0, draft, id })) as unknown as Record<string, unknown>
+    (await payload.findByID({ collection, depth: 0, draft, id, showHiddenFields: true })) as unknown as Record<string, unknown>
   /** What the owner is shown: the dry run's text, and its digest. */
   const dryRun = async (collection: string, id: number | string, apiKey = secrets.all) => {
     const { body } = await publish({ collection, dryRun: true, id }, apiKey)
@@ -331,6 +335,36 @@ describe('the publish lane over MCP', () => {
       return live.id as number
     }
 
+    /** Push the published version out of the capped history with ordinary draft saves, as an owner or a script can. */
+    const prunePublishedHistory = async (id: number) => {
+      for (let i = 0; i < 4; i += 1) {
+        await payload.update({ collection: 'case-studies', data: { title: `Owner edit after retire ${i}` }, draft: true, id })
+      }
+      const { docs } = await payload.findVersions({
+        collection: 'case-studies',
+        limit: 0,
+        pagination: false,
+        where: { parent: { equals: id } },
+      })
+      expect(docs.some((v) => (v as unknown as { version?: { _status?: string } }).version?._status === 'published')).toBe(false)
+      // The old inference now reads the document as never published: the evidence is gone.
+      expect(await standingOf(payload, 'case-studies', id)).toBe('never')
+    }
+
+    const legacyPinAnswer = async (id: number) => {
+      const data = { title: 'The legacy pin allows this save' }
+      const originalDoc = await status('case-studies', id, true)
+      const req = { context: {}, payload, payloadAPI: 'MCP' } as unknown as PayloadRequest
+      return publishPin({
+        collection: payload.collections['case-studies'].config,
+        context: {},
+        data,
+        operation: 'update',
+        originalDoc,
+        req,
+      } as never)
+    }
+
     it('is not republished from here, even with a fresh draft on top', async () => {
       const id = await retired()
       expect((await status('case-studies', id, false))._status).toBe('draft')
@@ -352,12 +386,83 @@ describe('the publish lane over MCP', () => {
       expect((await payload.findVersions({ collection: 'case-studies', where: { parent: { equals: id } } })).totalDocs).toBe(before)
     })
 
-    it('the owner-unpublished guard survives a pruned version history (maxPerDoc: 3)', async () => {
+    it('records retirement on the document and clears it on an owner republish', async () => {
+      const live = await liveStudy()
+      expect((await status('case-studies', live.id, false)).retired).not.toBe(true)
+      await payload.update({ collection: 'case-studies', data: { _status: 'draft' }, draft: false, id: live.id })
+      expect((await status('case-studies', live.id, false)).retired).toBe(true)
+      await payload.update({ collection: 'case-studies', data: { _status: 'published' }, draft: false, id: live.id })
+      expect((await status('case-studies', live.id, false)).retired).toBe(false)
+    })
+
+    it('records retirement even when the unpublish itself prunes the published version', async () => {
+      const live = await liveStudy()
+      // Fill the capped history (maxPerDoc: 3) before the owner unpublishes: the unpublish adds the
+      // fourth version and prunes the only published one before afterChange hooks run.
+      for (let i = 0; i < 2; i += 1) {
+        await payload.update({ collection: 'case-studies', data: { title: `Draft before retire ${i}` }, draft: true, id: live.id })
+      }
+      await payload.update({ collection: 'case-studies', data: { _status: 'draft' }, draft: false, id: live.id })
+      const { docs } = await payload.findVersions({
+        collection: 'case-studies',
+        limit: 0,
+        pagination: false,
+        where: { parent: { equals: live.id } },
+      })
+      expect(docs.some((v) => (v as unknown as { version?: { _status?: string } }).version?._status === 'published')).toBe(false)
+      expect((await status('case-studies', live.id, false)).retired).toBe(true)
+    })
+
+    it('publishDraft refuses a durably retired document after pruning, which the old inference allows', async () => {
       const id = await retired()
-      for (let i = 0; i < 6; i += 1) await call(secrets.all, 'updateCaseStudies', { id, title: `Agent save ${i}` })
+      const legacy = makePublishDraft({ collections: ['case-studies'] }, lane.publishPin)
+      const legacyReq = {
+        context: { mcpAccess: { caseStudies: { update: true } } },
+        payload,
+        user: { id: userId },
+      } as unknown as PayloadRequest
+      await expect(legacy({ collection: 'case-studies', dryRun: true, id }, legacyReq)).rejects.toThrow(/unpublished by the owner/)
+
+      await prunePublishedHistory(id)
+
+      // The same document and wiring with the pre-adapter inference produces a dry run: the bypass.
+      const bypass = await legacy({ collection: 'case-studies', dryRun: true, id }, legacyReq)
+      expect(bypass.content[0]?.text).toContain('Digest:')
+
       const { body } = await dryRun('case-studies', id)
       expect(failed(body)).toBe(true)
       expect(textOf(body)).toMatch(/unpublished by the owner/)
+    })
+
+    it('the lane pin refuses an MCP update of a durably retired document after pruning, which the old inference allows', async () => {
+      const id = await retired()
+      await expect(legacyPinAnswer(id)).rejects.toThrow(/unpublished by the owner/)
+      await prunePublishedHistory(id)
+      await expect(legacyPinAnswer(id)).resolves.toEqual({ title: 'The legacy pin allows this save' })
+
+      const before = (await payload.findVersions({ collection: 'case-studies', where: { parent: { equals: id } } })).totalDocs
+      const { body } = await call(secrets.all, 'updateCaseStudies', { id, title: 'An agent edits a pruned retired study' })
+      expect(textOf(body) + (body.error?.message ?? '')).toMatch(/unpublished by the owner/)
+      expect((await payload.findVersions({ collection: 'case-studies', where: { parent: { equals: id } } })).totalDocs).toBe(before)
+    })
+
+    it('MCP reads hide a durably retired document after pruning, which the old inference lists again', async () => {
+      const id = await retired()
+      const mine = await liveStudy()
+      const legacyRead = hideOwnerUnpublishedFromMcp('case-studies', () => true)
+      const legacyReq = { context: {}, payload, payloadAPI: 'MCP' } as unknown as PayloadRequest
+      const hiddenOf = async () => {
+        const result = await legacyRead({ req: legacyReq } as never)
+        return result === true ? [] : (result as { id: { not_in: (number | string)[] } }).id.not_in
+      }
+      expect(await hiddenOf()).toContain(id)
+
+      await prunePublishedHistory(id)
+      expect(await hiddenOf()).not.toContain(id)
+
+      const list = textOf((await call(secrets.all, 'findCaseStudies', { limit: 100 })).body)
+      expect(list).not.toMatch(new RegExp(`"id":${id},`))
+      expect(list).toMatch(new RegExp(`"id":${mine.id},`))
     })
 
     it('a document that was never published, and a live one with a draft on top, are still editable over MCP', async () => {
