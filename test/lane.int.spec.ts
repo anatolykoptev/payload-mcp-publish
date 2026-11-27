@@ -26,15 +26,16 @@ import makeConfig, { lane } from './fixtures/config.js'
  * - src/tool.ts `...as` -> `req` in the update (the site's draft-only hook re-drafts it): every publish case.
  * - src/pin.ts the `pin` comparison: "the update itself refuses a draft that moved after the check".
  * - src/pin.ts the MCP-update guard: "an MCP update of a document the owner took down is refused" and "the
- *   lane pin refuses an MCP update of a durably retired document after pruning".
+ *   pin itself refuses a lane-context update of a durably retired document after pruning".
  * - src/tool.ts the retirement refusal (or its adapter): "is not republished from here", "publishDraft refuses
  *   a durably retired document after pruning" and "the retirement adapter decides even when the live read and
  *   originalDoc say published".
- * - src/pin.ts the pinned publish's retirement refusal: "refuses the pinned commit when the owner retires the row
- *   after the pre-write check".
+ * - src/pin.ts the adapter check: "the pin itself refuses a lane-context update of a durably retired document after
+ *   pruning".
  * - src/access.ts the adapter's `retiredIds` not used: "MCP reads hide a durably retired document after pruning".
- * - src/retirement.ts the pre-write capture or the marker write: the two "records retirement" cases.
- * - src/retirement.ts returning a document with `retired` added: "does not expose the retirement marker in mutation responses".
+ * - src/retirement.ts the pre-write live read or the marker return: the two "records retirement" cases and the
+ *   throwing-after-change atomicity case.
+ * - src/retirement.ts field access exposing `retired`: "does not expose the retirement marker in mutation responses".
  * - src/retirement.ts the backfill marker write: "backfills retirements through the library marker".
  * - src/lane.ts `'publishDraft'` out of the off-by-default names: "a key without the box ticked has no publishDraft".
  * - src/tool.ts the catch made a catch-all (`return null` for every error): "only a missing document is not found".
@@ -396,7 +397,7 @@ describe('the publish lane over MCP', () => {
       expect((await status('case-studies', live.id, false)).retired).not.toBe(true)
       await payload.update({ collection: 'case-studies', data: { _status: 'draft' }, draft: false, id: live.id })
       expect((await status('case-studies', live.id, false)).retired).toBe(true)
-      await payload.update({ collection: 'case-studies', data: { _status: 'published' }, draft: false, id: live.id })
+      await payload.update({ collection: 'case-studies', data: { _status: 'published' }, draft: true, id: live.id })
       expect((await status('case-studies', live.id, false)).retired).toBe(false)
     })
 
@@ -416,6 +417,22 @@ describe('the publish lane over MCP', () => {
       })
       expect(docs.some((v) => (v as unknown as { version?: { _status?: string } }).version?._status === 'published')).toBe(false)
       expect((await status('case-studies', live.id, false)).retired).toBe(true)
+    })
+
+    it('keeps the owner unpublish and its marker in one row write when a later hook throws', async () => {
+      const live = await liveStudy()
+      await expect(
+        payload.update({
+          collection: 'case-studies',
+          context: { throwAfterWrite: true },
+          data: { _status: 'draft' },
+          draft: false,
+          id: live.id,
+        }),
+      ).rejects.toThrow(/after the row write/)
+      const row = await status('case-studies', live.id, false)
+      expect(row._status).toBe('draft')
+      expect(row.retired).toBe(true)
     })
 
     it('does not expose the retirement marker in mutation responses', async () => {
@@ -507,6 +524,24 @@ describe('the publish lane over MCP', () => {
       const before = (await payload.findVersions({ collection: 'case-studies', where: { parent: { equals: id } } })).totalDocs
       const { body } = await call(secrets.all, 'updateCaseStudies', { id, title: 'An agent edits a pruned retired study' })
       expect(textOf(body) + (body.error?.message ?? '')).toMatch(/unpublished by the owner/)
+      expect((await payload.findVersions({ collection: 'case-studies', where: { parent: { equals: id } } })).totalDocs).toBe(before)
+    })
+
+    it('the pin itself refuses a lane-context update of a durably retired document after pruning', async () => {
+      const id = await retired()
+      await prunePublishedHistory(id)
+      const before = (await payload.findVersions({ collection: 'case-studies', where: { parent: { equals: id } } })).totalDocs
+
+      await expect(
+        payload.update({
+          collection: 'case-studies',
+          data: { title: 'Direct lane write after pruning' },
+          draft: true,
+          id,
+          req: { context: {}, payloadAPI: 'MCP' },
+        }),
+      ).rejects.toThrow(/unpublished by the owner/)
+
       expect((await payload.findVersions({ collection: 'case-studies', where: { parent: { equals: id } } })).totalDocs).toBe(before)
     })
 
@@ -657,19 +692,6 @@ describe('the publish lane over MCP', () => {
       expect(textOf(body)).toMatch(/changed while it was being published/)
       expect((await status('posts', id, false)).title).toBe('Live title')
       expect((await status('posts', id, false))._status).toBe('published')
-    })
-
-    it('refuses the pinned commit when the owner retires the row after the pre-write check', async () => {
-      const { id } = await pendingPost()
-      const seen = await publish({ collection: 'posts', dryRun: true, id, retire: true })
-      expect(failed(seen.body), textOf(seen.body)).toBe(false)
-      const digest = /Digest: ([0-9a-f]{64})/.exec(textOf(seen.body))?.[1] ?? ''
-      // The gate retires the row only on the commit call, after publishDraft's own check and before the update.
-      const { body } = await publish({ collection: 'posts', digest, id, retire: true })
-      expect(failed(body)).toBe(true)
-      expect(textOf(body)).toMatch(/unpublished by the owner/)
-      expect((await status('posts', id, false))._status).toBe('draft')
-      expect((await status('posts', id, false)).retired).toBe(true)
     })
   })
 

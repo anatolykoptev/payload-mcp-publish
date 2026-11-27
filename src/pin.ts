@@ -2,9 +2,9 @@ import type { CollectionBeforeChangeHook, CollectionSlug, Payload, PayloadReques
 import { APIError } from 'payload'
 import { inferredRetirement, type RetirementAdapter } from './ownerUnpublished.js'
 
-const retirementRefusal = (collection: string, id: number | string, publish: boolean) =>
+const retirementRefusal = (collection: string, id: number | string) =>
   new APIError(
-    `${collection} #${String(id)} was unpublished by the owner; ${publish ? 'nothing was published' : 'it cannot be edited from here'}. Republish or edit it in the admin.`,
+    `${collection} #${String(id)} was unpublished by the owner; it cannot be edited from here. Republish or edit it in the admin.`,
     409,
     undefined,
     true,
@@ -47,15 +47,6 @@ export const makePublishPin = (retirement?: RetirementAdapter): CollectionBefore
       if (!originalDoc || Date.parse(String(originalDoc.updatedAt)) !== pin) {
         throw new APIError('The draft changed while it was being published; nothing was published. Review it again.', 409, undefined, true)
       }
-      const retired = await checkRetirement(
-        decide,
-        req.payload,
-        collection,
-        originalDoc.id as number | string,
-        req,
-        retirement !== undefined,
-      )
-      if (retired) throw retirementRefusal(collection.slug, originalDoc.id as number | string, true)
       return data
     }
     if ((req.payloadAPI as string) !== 'MCP') return data
@@ -71,7 +62,7 @@ export const makePublishPin = (retirement?: RetirementAdapter): CollectionBefore
         req,
         retirement !== undefined,
       )
-      if (retired) throw retirementRefusal(collection.slug, originalDoc.id as number | string, false)
+      if (retired) throw retirementRefusal(collection.slug, originalDoc.id as number | string)
     }
     return data
   }

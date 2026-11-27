@@ -110,7 +110,7 @@ when a published version is still in its version history. If `versions.maxPerDoc
 Sites that cap versions can make the decision durable on the document itself:
 
 ```ts
-import { durableRetirement, mcpPublishLane, retiredField, trackRetirement } from 'payload-mcp-publish'
+import { durableRetirement, mcpPublishLane, retiredField } from 'payload-mcp-publish'
 
 export const lane = mcpPublishLane({
   collections: ['services'],
@@ -118,28 +118,25 @@ export const lane = mcpPublishLane({
 })
 ```
 
-On **every** collection the lane lists, add the field and both hooks, and use the lane's own read helper:
+On **every** collection the lane lists, add the field and use the lane's own read helper:
 
 ```ts
 access: { read: lane.hideOwnerUnpublishedFromMcp('services', yourReadAccess) },
-hooks: {
-  beforeChange: [lane.publishPin],
-  afterChange: [trackRetirement],
-},
+hooks: { beforeChange: [lane.publishPin] },
 fields: [
   retiredField(),
   // ...your fields
 ],
 ```
 
-`retiredField()` adds a hidden `retired` checkbox owned by the lane. Normal writes cannot set it. `trackRetirement` sets it
-when a published document becomes unpublished and clears it only when the owner (not the MCP lane) publishes the document
-again; the write is inside the same transaction, does not create a version, and survives `maxPerDoc` pruning. Generate a
-migration for the new field.
+`retiredField()` adds a hidden `retired` checkbox owned by the lane. Normal writes cannot set it. Its own `beforeChange`
+hook sets it when a published document becomes unpublished and clears it only when the owner (not the MCP lane) publishes
+the document again. The marker is part of the same row write as the owner's status change and survives `maxPerDoc`
+pruning. Generate a migration for the new field.
 
 The hook records retirements that happen after it is installed. Migrate existing retirements in this order:
 
-1. Deploy `retiredField()` and `trackRetirement` (and the field's migration) while the lane still uses the old inference:
+1. Deploy `retiredField()` (and its migration) while the lane still uses the old inference:
    do not pass `retirement: durableRetirement` yet.
 2. Run the backfill while the published history is still present:
 
@@ -159,8 +156,13 @@ still unpublished. A document whose published history was already pruned cannot 
 explicitly or delete them.
 
 `durableRetirement` fails loudly unless the collection has the exact `retiredField()` (recognized by the exported
-`retiredFieldMarker`, not merely the name `retired`) and `trackRetirement` in `afterChange`. A plain checkbox named
-`retired` is not wiring.
+`retiredFieldMarker`, not merely the name `retired`) with its hook. A plain checkbox named `retired` is not wiring.
+
+### Known limit
+
+A publish racing an owner unpublish within the same moment is not serialised: the publish can read before the unpublish
+and write after it. Closing that window needs a database row lock or a post-write check in the same transaction; it is
+tracked separately.
 
 A custom adapter is one object and both methods are required; the three guards then share that one source of truth:
 

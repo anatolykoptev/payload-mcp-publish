@@ -1,15 +1,7 @@
 import type { CollectionConfig, PayloadRequest } from 'payload'
 import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
-import {
-  diffSummary,
-  hideOwnerUnpublishedFromMcp,
-  lexicalText,
-  mcpPublishLane,
-  publishPin,
-  retiredField,
-  trackRetirement,
-} from '../src/index.js'
+import { diffSummary, hideOwnerUnpublishedFromMcp, lexicalText, mcpPublishLane, publishPin, retiredField } from '../src/index.js'
 import { offByDefault } from '../src/lane.js'
 import { durableRetirementWiringProblem } from '../src/retirement.js'
 
@@ -18,8 +10,7 @@ import { durableRetirementWiringProblem } from '../src/retirement.js'
  * `payload-mcp-tool`: "unticks only the named tool checkboxes". `overrideAuth` not calling `inner` or not stashing:
  * the two `overrideAuth` cases. `mcpPublishLane` without the empty-list check: "refuses an empty lane".
  * src/retirement.ts identifying the marker by name rather than `retiredFieldMarker`: "accepts only the marked field
- * and collection hook together". `trackRetirement` clearing the marker on a lane publish: "keeps the marker on a
- * pinned lane publish".
+ * with its hook". The field hook clearing the marker on a lane publish: "keeps the marker on a pinned lane publish".
  */
 const keys = (): CollectionConfig => ({
   slug: 'payload-mcp-api-keys',
@@ -135,46 +126,36 @@ describe('mcpPublishLane', () => {
 })
 
 describe('durable retirement wiring', () => {
-  const problem = (fields: CollectionConfig['fields'], afterChange: unknown[]) =>
-    durableRetirementWiringProblem({ fields, hooks: { afterChange }, slug: 'posts' })
+  const problem = (fields: CollectionConfig['fields']) => durableRetirementWiringProblem({ fields, slug: 'posts' })
 
-  it('accepts only the marked field and collection hook together', () => {
-    expect(problem([retiredField()], [trackRetirement])).toBeUndefined()
-    expect(problem([{ name: 'retired', type: 'checkbox' }], [trackRetirement])).toMatch(/retiredField/)
+  it('accepts only the marked field with its hook', () => {
+    expect(problem([retiredField()])).toBeUndefined()
+    expect(problem([{ name: 'retired', type: 'checkbox' }])).toMatch(/retiredField/)
     const unmarked = retiredField()
     for (const symbol of Object.getOwnPropertySymbols(unmarked)) Reflect.deleteProperty(unmarked, symbol)
-    expect(problem([unmarked], [trackRetirement])).toMatch(/retiredField/)
-    expect(problem([retiredField()], [])).toMatch(/trackRetirement/)
-    expect(problem([], [trackRetirement])).toMatch(/retiredField/)
-    expect(problem([{ ...retiredField(), hooks: {} }], [trackRetirement])).toMatch(/retiredField/)
+    expect(problem([unmarked])).toMatch(/retiredField/)
+    expect(problem([])).toMatch(/retiredField/)
+    expect(problem([{ ...retiredField(), hooks: {} }])).toMatch(/retiredField/)
   })
 
-  it('keeps the marker on a pinned lane publish and returns the response document unchanged', async () => {
+  it('keeps the marker on a pinned lane publish', async () => {
     const field = retiredField()
-    const collection = {
-      fields: [field],
-      flattenedFields: [field],
-      hooks: { afterChange: [trackRetirement] },
-      slug: 'posts',
-    }
-    const writes: unknown[] = []
+    const hook = field.hooks?.beforeChange?.[0]
     const payload = {
       db: {
-        findOne: async () => ({ _status: 'published', id: 1, retired: false }),
-        updateOne: async (args: { data: unknown }) => {
-          writes.push(args.data)
-          return null
-        },
+        findOne: async () => ({ _status: 'draft', id: 1, retired: true }),
       },
     }
-    const doc = { id: 1, title: 'Published' }
-    const context = {
-      publishPin: 1,
-      'mcpPublishRetirement.previousLive': { [JSON.stringify(['posts', '1'])]: { retired: true, status: 'draft' } },
-    }
-    const result = await trackRetirement({ collection, context, doc, operation: 'update', req: { payload } } as never)
-    expect(writes).toEqual([{ retired: true }])
-    expect(result).toBe(doc)
+    const result = await hook?.({
+      collection: { slug: 'posts' },
+      context: { publishPin: 1 },
+      data: { _status: 'published', id: 1 },
+      operation: 'update',
+      originalDoc: { id: 1 },
+      previousValue: false,
+      req: { payload },
+    } as never)
+    expect(result).toBe(true)
   })
 })
 

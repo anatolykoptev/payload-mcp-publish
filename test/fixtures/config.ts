@@ -3,9 +3,9 @@ import path from 'node:path'
 import { sqliteAdapter } from '@payloadcms/db-sqlite'
 import { mcpPlugin } from '@payloadcms/plugin-mcp'
 import { lexicalEditor } from '@payloadcms/richtext-lexical'
-import { buildConfig, type CollectionConfig } from 'payload'
+import { buildConfig, type CollectionAfterChangeHook, type CollectionConfig } from 'payload'
 import { z } from 'zod'
-import { durableRetirement, mcpPublishLane, retiredField, trackRetirement } from '../../src/index.js'
+import { durableRetirement, mcpPublishLane, retiredField } from '../../src/index.js'
 import { draftOnly } from './draftOnly.js'
 
 const dir = path.resolve(process.cwd(), 'test/.tmp')
@@ -21,9 +21,8 @@ const gate = {
       .object({ basis: z.enum(BASES), sourceNote: z.string().optional() })
       .optional()
       .describe('Only for a document whose draft has no basis. Not accepted for collections without a gate.'),
-    // Test levers: a gate that saves a draft or retires the row between the tool's read and its write, and one that tries to overwrite content.
+    // Test levers: a gate that saves a draft between the tool's read and its write, and one that tries to overwrite content.
     touch: z.boolean().optional(),
-    retire: z.boolean().optional(),
     clobber: z.enum(['title', '_status']).optional(),
   },
   check: async ({
@@ -38,14 +37,6 @@ const gate = {
     req: any
   }) => {
     if (args.touch) await req.payload.update({ collection: 'posts', data: { title: 'Moved after the read' }, draft: true, id: draft.id })
-    if (args.retire && args.dryRun !== true) {
-      await req.payload.db.updateOne({
-        collection: collection as never,
-        data: { _status: 'draft', retired: true },
-        id: draft.id as number,
-        returning: false,
-      })
-    }
     if (args.clobber) return { data: { [args.clobber as string]: args.clobber === '_status' ? 'draft' : 'Overwritten by the gate' } }
     const verification = args.verification as undefined | { basis: (typeof BASES)[number]; sourceNote?: string }
     if (!verification) return
@@ -73,10 +64,17 @@ const hooks = {
   beforeOperation: [draftOnly],
 }
 
+// Test lever for the transactionless SQLite fixture: when the update carries this context flag, fail only after Payload
+// has written the row. The durable marker must already be in that same row write.
+const throwAfterWriteWhenAsked: CollectionAfterChangeHook = ({ context, doc }) => {
+  if ((context as { throwAfterWrite?: unknown }).throwAfterWrite === true) throw new Error('after the row write')
+  return doc
+}
+
 const posts: CollectionConfig = {
   slug: 'posts',
   access: { read: readLatest },
-  hooks: { ...hooks, afterChange: [trackRetirement] },
+  hooks,
   versions: { drafts: true },
   fields: [
     { name: 'title', type: 'text', required: true },
@@ -100,7 +98,7 @@ const posts: CollectionConfig = {
 const caseStudies: CollectionConfig = {
   slug: 'case-studies',
   access: { read: lane.hideOwnerUnpublishedFromMcp('case-studies', readLatest as never) },
-  hooks: { ...hooks, afterChange: [trackRetirement] },
+  hooks: { ...hooks, afterChange: [throwAfterWriteWhenAsked] },
   versions: { drafts: true, maxPerDoc: 3 },
   fields: [
     { name: 'title', type: 'text', required: true },
