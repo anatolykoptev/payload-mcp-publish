@@ -1,13 +1,16 @@
 import type { CollectionConfig, PayloadRequest } from 'payload'
 import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
-import { diffSummary, lexicalText, mcpPublishLane } from '../src/index.js'
+import { diffSummary, hideOwnerUnpublishedFromMcp, lexicalText, mcpPublishLane, publishPin, retiredField } from '../src/index.js'
 import { offByDefault } from '../src/lane.js'
+import { durableRetirementWiringProblem } from '../src/retirement.js'
 
 /**
  * Mutations: src/lane.ts `offByDefault` setting `defaultValue: false` on every checkbox, or not recursing into
  * `payload-mcp-tool`: "unticks only the named tool checkboxes". `overrideAuth` not calling `inner` or not stashing:
  * the two `overrideAuth` cases. `mcpPublishLane` without the empty-list check: "refuses an empty lane".
+ * src/retirement.ts identifying the marker by name rather than `retiredFieldMarker`: "accepts only the marked field
+ * with its hook". The field hook clearing the marker on a lane publish: "keeps the marker on a pinned lane publish".
  */
 const keys = (): CollectionConfig => ({
   slug: 'payload-mcp-api-keys',
@@ -56,6 +59,23 @@ describe('mcpPublishLane', () => {
     expect(() => mcpPublishLane({ collections: [] })).toThrow(/at least one collection/)
   })
 
+  it('keeps the legacy pin and read helper on a plain lane, and makes adapter closures on a retirement lane', () => {
+    const plain = mcpPublishLane({ collections: ['posts'] })
+    expect(plain.publishPin).toBe(publishPin)
+    expect(plain.hideOwnerUnpublishedFromMcp).toBe(hideOwnerUnpublishedFromMcp)
+
+    const retirement = { isRetired: async () => false, retiredIds: async () => [] }
+    const durable = mcpPublishLane({ collections: ['posts'], retirement })
+    expect(durable.publishPin).not.toBe(publishPin)
+    expect(durable.hideOwnerUnpublishedFromMcp).not.toBe(hideOwnerUnpublishedFromMcp)
+  })
+
+  it('refuses a partial retirement adapter', () => {
+    expect(() => mcpPublishLane({ collections: ['posts'], retirement: { isRetired: async () => false } as never })).toThrow(
+      /isRetired.*retiredIds/,
+    )
+  })
+
   it('overrideAuth stashes the resolved access on the request and returns it', async () => {
     const lane = mcpPublishLane({ collections: ['posts'] })
     const req = { context: {} } as unknown as PayloadRequest
@@ -102,6 +122,40 @@ describe('mcpPublishLane', () => {
     })(req, async () => resolved)
     expect(out.user._strategy).toBe('api-key')
     expect((req.context as { mcpAccess?: unknown }).mcpAccess).toBe(resolved)
+  })
+})
+
+describe('durable retirement wiring', () => {
+  const problem = (fields: CollectionConfig['fields']) => durableRetirementWiringProblem({ fields, slug: 'posts' })
+
+  it('accepts only the marked field with its hook', () => {
+    expect(problem([retiredField()])).toBeUndefined()
+    expect(problem([{ name: 'retired', type: 'checkbox' }])).toMatch(/retiredField/)
+    const unmarked = retiredField()
+    for (const symbol of Object.getOwnPropertySymbols(unmarked)) Reflect.deleteProperty(unmarked, symbol)
+    expect(problem([unmarked])).toMatch(/retiredField/)
+    expect(problem([])).toMatch(/retiredField/)
+    expect(problem([{ ...retiredField(), hooks: {} }])).toMatch(/retiredField/)
+  })
+
+  it('keeps the marker on a pinned lane publish', async () => {
+    const field = retiredField()
+    const hook = field.hooks?.beforeChange?.[0]
+    const payload = {
+      db: {
+        findOne: async () => ({ _status: 'draft', id: 1, retired: true }),
+      },
+    }
+    const result = await hook?.({
+      collection: { slug: 'posts' },
+      context: { publishPin: 1 },
+      data: { _status: 'published', id: 1 },
+      operation: 'update',
+      originalDoc: { id: 1 },
+      previousValue: false,
+      req: { payload },
+    } as never)
+    expect(result).toBe(true)
   })
 })
 

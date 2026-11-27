@@ -3,9 +3,9 @@ import path from 'node:path'
 import { sqliteAdapter } from '@payloadcms/db-sqlite'
 import { mcpPlugin } from '@payloadcms/plugin-mcp'
 import { lexicalEditor } from '@payloadcms/richtext-lexical'
-import { buildConfig, type CollectionConfig } from 'payload'
+import { buildConfig, type CollectionAfterChangeHook, type CollectionConfig } from 'payload'
 import { z } from 'zod'
-import { hideOwnerUnpublishedFromMcp, mcpPublishLane } from '../../src/index.js'
+import { durableRetirement, mcpPublishLane, retiredField } from '../../src/index.js'
 import { draftOnly } from './draftOnly.js'
 
 const dir = path.resolve(process.cwd(), 'test/.tmp')
@@ -55,12 +55,20 @@ const gate = {
 export const lane = mcpPublishLane({
   collections: ['posts', 'case-studies', 'unwired'],
   gate,
+  retirement: durableRetirement,
   urlFor: (collection, doc) => `https://example.test/${collection}/${String(doc.slug)}`,
 })
 
 const hooks = {
   beforeChange: [lane.publishPin],
   beforeOperation: [draftOnly],
+}
+
+// Test lever for the transactionless SQLite fixture: when the update carries this context flag, fail only after Payload
+// has written the row. The durable marker must already be in that same row write.
+const throwAfterWriteWhenAsked: CollectionAfterChangeHook = ({ context, doc }) => {
+  if ((context as { throwAfterWrite?: unknown }).throwAfterWrite === true) throw new Error('after the row write')
+  return doc
 }
 
 const posts: CollectionConfig = {
@@ -73,6 +81,7 @@ const posts: CollectionConfig = {
     { name: 'slug', type: 'text' },
     { name: 'blurb', type: 'textarea' },
     { name: 'body', type: 'richText' },
+    retiredField(),
     {
       name: 'sections',
       type: 'array',
@@ -88,13 +97,14 @@ const posts: CollectionConfig = {
 // that hides what the owner took down from an MCP key.
 const caseStudies: CollectionConfig = {
   slug: 'case-studies',
-  access: { read: hideOwnerUnpublishedFromMcp('case-studies', readLatest as never) },
-  hooks,
+  access: { read: lane.hideOwnerUnpublishedFromMcp('case-studies', readLatest as never) },
+  hooks: { ...hooks, afterChange: [throwAfterWriteWhenAsked] },
   versions: { drafts: true, maxPerDoc: 3 },
   fields: [
     { name: 'title', type: 'text', required: true },
     { name: 'slug', type: 'text' },
     { name: 'summary', type: 'textarea' },
+    retiredField(),
     {
       name: 'verification',
       type: 'group',

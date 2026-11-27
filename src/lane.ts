@@ -1,6 +1,7 @@
-import type { CollectionConfig, Field, PayloadRequest } from 'payload'
+import type { Access, CollectionConfig, CollectionSlug, Field, PayloadRequest } from 'payload'
 import type { z } from 'zod'
-import { publishPin } from './pin.js'
+import { hideOwnerUnpublishedFromMcp, makeHideOwnerUnpublishedFromMcp } from './access.js'
+import { makePublishPin, publishPin } from './pin.js'
 import { makePublishDraft, type PublishToolOptions, publishDraftDescription, publishDraftParameters } from './tool.js'
 
 const RESERVED = new Set(['collection', 'digest', 'dryRun', 'id'])
@@ -18,6 +19,11 @@ export type PublishDraftTool = {
 export type PublishLane = {
   /** Add this to `mcp.tools`. */
   tool: PublishDraftTool
+  /**
+   * Read access hiding owner-retired documents from MCP reads, using the lane's retirement adapter.
+   * Wrap the collection's own `read` access with it. Without an adapter it is the exported inference helper.
+   */
+  hideOwnerUnpublishedFromMcp: (collection: CollectionSlug, base: Access) => Access
   /** Add this to `hooks.beforeChange` of every listed collection. */
   publishPin: typeof publishPin
   /**
@@ -61,8 +67,14 @@ export function mcpPublishLane(options: PublishLaneOptions): PublishLane {
   const collections = [...new Set(options.collections)]
   const taken = Object.keys(options.gate?.parameters ?? {}).filter((k) => RESERVED.has(k))
   if (taken.length) throw new Error(`mcpPublishLane: gate parameters may not reuse the tool's own names (${taken.join(', ')}).`)
+  if (options.retirement && (typeof options.retirement.isRetired !== 'function' || typeof options.retirement.retiredIds !== 'function')) {
+    throw new Error('mcpPublishLane: `retirement` must implement both `isRetired` and `retiredIds`.')
+  }
   const o = { ...options, collections }
+  const pin = options.retirement ? makePublishPin(options.retirement) : publishPin
+  const hide = options.retirement ? makeHideOwnerUnpublishedFromMcp(options.retirement) : hideOwnerUnpublishedFromMcp
   return {
+    hideOwnerUnpublishedFromMcp: hide,
     offByDefault: (collection, more = []) => offByDefault(collection, new Set(['publishDraft', ...more])),
     overrideAuth: (inner) => async (req, getDefault) => {
       // What the plugin uses is what this returns, so that is what the tool must read: a site's own override may narrow it.
@@ -71,10 +83,10 @@ export function mcpPublishLane(options: PublishLaneOptions): PublishLane {
       req.context.mcpAccess = resolved
       return resolved
     },
-    publishPin,
+    publishPin: pin,
     tool: {
       description: publishDraftDescription,
-      handler: makePublishDraft(o),
+      handler: makePublishDraft(o, pin),
       name: 'publishDraft',
       parameters: publishDraftParameters(o),
     },
