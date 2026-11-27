@@ -4,8 +4,8 @@ import { rmSync } from 'node:fs'
 import { REST_POST } from '@payloadcms/next/routes'
 import { getPayload, type Payload, type PayloadRequest } from 'payload'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { hideOwnerUnpublishedFromMcp, standingOf } from '../src/index.js'
-import { publishPin } from '../src/pin.js'
+import { backfillRetirement, hideOwnerUnpublishedFromMcp, standingOf } from '../src/index.js'
+import { makePublishPin, publishPin } from '../src/pin.js'
 import { makePublishDraft } from '../src/tool.js'
 import makeConfig, { lane } from './fixtures/config.js'
 
@@ -27,10 +27,15 @@ import makeConfig, { lane } from './fixtures/config.js'
  * - src/pin.ts the `pin` comparison: "the update itself refuses a draft that moved after the check".
  * - src/pin.ts the MCP-update guard: "an MCP update of a document the owner took down is refused" and "the
  *   lane pin refuses an MCP update of a durably retired document after pruning".
- * - src/tool.ts the retirement refusal (or its adapter): "is not republished from here" and "publishDraft refuses
- *   a durably retired document after pruning".
+ * - src/tool.ts the retirement refusal (or its adapter): "is not republished from here", "publishDraft refuses
+ *   a durably retired document after pruning" and "the retirement adapter decides even when the live read and
+ *   originalDoc say published".
+ * - src/pin.ts the pinned publish's retirement refusal: "refuses the pinned commit when the owner retires the row
+ *   after the pre-write check".
  * - src/access.ts the adapter's `retiredIds` not used: "MCP reads hide a durably retired document after pruning".
  * - src/retirement.ts the pre-write capture or the marker write: the two "records retirement" cases.
+ * - src/retirement.ts returning a document with `retired` added: "does not expose the retirement marker in mutation responses".
+ * - src/retirement.ts the backfill marker write: "backfills retirements through the library marker".
  * - src/lane.ts `'publishDraft'` out of the off-by-default names: "a key without the box ticked has no publishDraft".
  * - src/tool.ts the catch made a catch-all (`return null` for every error): "only a missing document is not found".
  * - src/diff.ts `diffSummary` cutting text at 400 characters, or counting array rows: the "full text" cases.
@@ -413,6 +418,59 @@ describe('the publish lane over MCP', () => {
       expect((await status('case-studies', live.id, false)).retired).toBe(true)
     })
 
+    it('does not expose the retirement marker in mutation responses', async () => {
+      const live = await liveStudy()
+      const updated = await call(secrets.all, 'updateCaseStudies', { id: live.id, title: 'A draft response' })
+      expect(failed(updated.body), textOf(updated.body)).toBe(false)
+      expect(textOf(updated.body)).not.toContain('"retired"')
+      const unpublished = await payload.update({ collection: 'case-studies', data: { _status: 'draft' }, draft: false, id: live.id })
+      expect('retired' in unpublished).toBe(false)
+    })
+
+    it('backfills retirements through the library marker, without marking a live document', async () => {
+      const id = await retired()
+      await payload.db.updateOne({ collection: 'case-studies', data: { retired: false }, id, returning: false })
+      expect((await status('case-studies', id, false)).retired).toBe(false)
+      const live = await liveStudy()
+
+      const marked = await backfillRetirement(payload, 'case-studies')
+
+      expect(marked).toContain(id)
+      expect(marked).not.toContain(live.id)
+      expect((await status('case-studies', id, false)).retired).toBe(true)
+      expect((await status('case-studies', live.id, false)).retired).not.toBe(true)
+    })
+
+    it('the retirement adapter decides even when the live read and originalDoc say published', async () => {
+      const { id } = await pendingPost()
+      const broken = {
+        isRetired: async () => {
+          throw new Error('retirement backend down')
+        },
+        retiredIds: async () => [],
+      }
+      const handler = makePublishDraft({ collections: ['posts'], retirement: broken }, lane.publishPin)
+      const toolReq = {
+        context: { mcpAccess: { posts: { update: true } } },
+        payload,
+        user: { id: userId },
+      } as unknown as PayloadRequest
+      await expect(handler({ collection: 'posts', dryRun: true, id }, toolReq)).rejects.toThrow('retirement backend down')
+
+      const pin = makePublishPin(broken)
+      const pinReq = { context: {}, payload, payloadAPI: 'MCP' } as unknown as PayloadRequest
+      await expect(
+        pin({
+          collection: payload.collections.posts.config,
+          context: {},
+          data: { title: 'A draft save' },
+          operation: 'update',
+          originalDoc: { _status: 'published', id },
+          req: pinReq,
+        } as never),
+      ).rejects.toThrow('retirement backend down')
+    })
+
     it('publishDraft refuses a durably retired document after pruning, which the old inference allows', async () => {
       const id = await retired()
       const legacy = makePublishDraft({ collections: ['case-studies'] }, lane.publishPin)
@@ -428,10 +486,16 @@ describe('the publish lane over MCP', () => {
       // The same document and wiring with the pre-adapter inference produces a dry run: the bypass.
       const bypass = await legacy({ collection: 'case-studies', dryRun: true, id }, legacyReq)
       expect(bypass.content[0]?.text).toContain('Digest:')
+      const digest = /Digest: ([0-9a-f]{64})/.exec(bypass.content[0]?.text ?? '')?.[1] ?? ''
+      expect(digest).toHaveLength(64)
 
       const { body } = await dryRun('case-studies', id)
       expect(failed(body)).toBe(true)
       expect(textOf(body)).toMatch(/unpublished by the owner/)
+      const commit = await publish({ collection: 'case-studies', digest, id })
+      expect(failed(commit.body)).toBe(true)
+      expect(textOf(commit.body)).toMatch(/unpublished by the owner/)
+      expect((await status('case-studies', id, false))._status).toBe('draft')
     })
 
     it('the lane pin refuses an MCP update of a durably retired document after pruning, which the old inference allows', async () => {
@@ -450,9 +514,9 @@ describe('the publish lane over MCP', () => {
       const id = await retired()
       const mine = await liveStudy()
       const legacyRead = hideOwnerUnpublishedFromMcp('case-studies', () => true)
-      const legacyReq = { context: {}, payload, payloadAPI: 'MCP' } as unknown as PayloadRequest
       const hiddenOf = async () => {
-        const result = await legacyRead({ req: legacyReq } as never)
+        const req = { context: {}, payload, payloadAPI: 'MCP' } as unknown as PayloadRequest
+        const result = await legacyRead({ req } as never)
         return result === true ? [] : (result as { id: { not_in: (number | string)[] } }).id.not_in
       }
       expect(await hiddenOf()).toContain(id)
@@ -593,6 +657,19 @@ describe('the publish lane over MCP', () => {
       expect(textOf(body)).toMatch(/changed while it was being published/)
       expect((await status('posts', id, false)).title).toBe('Live title')
       expect((await status('posts', id, false))._status).toBe('published')
+    })
+
+    it('refuses the pinned commit when the owner retires the row after the pre-write check', async () => {
+      const { id } = await pendingPost()
+      const seen = await publish({ collection: 'posts', dryRun: true, id, retire: true })
+      expect(failed(seen.body), textOf(seen.body)).toBe(false)
+      const digest = /Digest: ([0-9a-f]{64})/.exec(textOf(seen.body))?.[1] ?? ''
+      // The gate retires the row only on the commit call, after publishDraft's own check and before the update.
+      const { body } = await publish({ collection: 'posts', digest, id, retire: true })
+      expect(failed(body)).toBe(true)
+      expect(textOf(body)).toMatch(/unpublished by the owner/)
+      expect((await status('posts', id, false))._status).toBe('draft')
+      expect((await status('posts', id, false)).retired).toBe(true)
     })
   })
 

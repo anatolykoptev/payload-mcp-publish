@@ -66,7 +66,7 @@ export const makePublishDraft = (o: PublishToolOptions, pin?: Pin) => async (arg
     return refuse(`\`${collection}\` cannot be published from here. Allowed: ${o.collections.join(', ')}.`)
   }
   const slug = collection as never
-  const unwired = wiringProblem(payload, collection, pin)
+  const unwired = wiringProblem(payload, collection, pin, o.retirement)
   if (unwired) return refuse(unwired)
   // The key must be allowed to edit this collection, not only to publish.
   const access = (req.context as { mcpAccess?: Record<string, { update?: boolean } | undefined> } | undefined)?.mcpAccess
@@ -100,7 +100,7 @@ export const makePublishDraft = (o: PublishToolOptions, pin?: Pin) => async (arg
   // draft with a published version in its history is one the owner took down.
   const liveRow = await read(false)
   const live = liveRow?._status === 'published' ? liveRow : undefined
-  if (!live) {
+  if (o.retirement || !live) {
     const retired = await (o.retirement ?? inferredRetirement).isRetired(payload, slug, id, req)
     if (retired) return refuse(`${name} was unpublished by the owner; republish in the admin.`)
   }

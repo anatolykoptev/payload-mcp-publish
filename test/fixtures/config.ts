@@ -21,8 +21,9 @@ const gate = {
       .object({ basis: z.enum(BASES), sourceNote: z.string().optional() })
       .optional()
       .describe('Only for a document whose draft has no basis. Not accepted for collections without a gate.'),
-    // Test levers: a gate that saves a draft between the tool's read and its write, and one that tries to overwrite content.
+    // Test levers: a gate that saves a draft or retires the row between the tool's read and its write, and one that tries to overwrite content.
     touch: z.boolean().optional(),
+    retire: z.boolean().optional(),
     clobber: z.enum(['title', '_status']).optional(),
   },
   check: async ({
@@ -37,6 +38,14 @@ const gate = {
     req: any
   }) => {
     if (args.touch) await req.payload.update({ collection: 'posts', data: { title: 'Moved after the read' }, draft: true, id: draft.id })
+    if (args.retire && args.dryRun !== true) {
+      await req.payload.db.updateOne({
+        collection: collection as never,
+        data: { _status: 'draft', retired: true },
+        id: draft.id as number,
+        returning: false,
+      })
+    }
     if (args.clobber) return { data: { [args.clobber as string]: args.clobber === '_status' ? 'draft' : 'Overwritten by the gate' } }
     const verification = args.verification as undefined | { basis: (typeof BASES)[number]; sourceNote?: string }
     if (!verification) return

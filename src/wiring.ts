@@ -1,4 +1,5 @@
 import type { CollectionBeforeChangeHook, CollectionSlug, Field, Payload } from 'payload'
+import type { RetirementAdapter } from './ownerUnpublished.js'
 import { publishPin } from './pin.js'
 
 const localized = (fields: Field[] | undefined): boolean =>
@@ -22,7 +23,12 @@ const localized = (fields: Field[] | undefined): boolean =>
  * only half wired fails open: without the hook nothing pins the reviewed draft, without drafts there is no draft, and
  * with localized fields the diff and the digest would cover one locale of several.
  */
-export const wiringProblem = (payload: Payload, collection: string, pin: CollectionBeforeChangeHook = publishPin): string | undefined => {
+export const wiringProblem = (
+  payload: Payload,
+  collection: string,
+  pin: CollectionBeforeChangeHook = publishPin,
+  retirement?: RetirementAdapter,
+): string | undefined => {
   const config = payload.collections[collection as CollectionSlug]?.config
   if (!config) return `\`${collection}\` is not a collection of this site.`
   if (!config.versions?.drafts) return `${collection} has no drafts (\`versions.drafts\`), so there is nothing to publish.`
@@ -30,6 +36,8 @@ export const wiringProblem = (payload: Payload, collection: string, pin: Collect
   if (!before.includes(pin)) {
     return `${collection} is not wired: add \`lane.publishPin\` to its \`hooks.beforeChange\`. Nothing would pin the reviewed draft.`
   }
+  const retirementProblem = retirement?.wiringProblem?.(config)
+  if (retirementProblem) return retirementProblem
   if (payload.config.localization && localized(config.fields)) {
     return `${collection} has localized fields; the lane reviews one locale and would publish all of them. Publish it in the admin.`
   }

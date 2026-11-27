@@ -1,8 +1,21 @@
-import type { CheckboxField, CollectionAfterChangeHook, CollectionSlug, FieldHook, Payload, PayloadRequest } from 'payload'
-import type { RetirementAdapter } from './ownerUnpublished.js'
+import type {
+  CheckboxField,
+  CollectionAfterChangeHook,
+  CollectionSlug,
+  Field,
+  FieldHook,
+  FlattenedField,
+  Payload,
+  PayloadRequest,
+} from 'payload'
+import { flattenAllFields } from 'payload'
+import { ownerUnpublishedIds, type RetirementAdapter } from './ownerUnpublished.js'
 
 const FIELD = 'retired'
 const CAPTURE = 'mcpPublishRetirement.previousLive'
+
+/** Set by `retiredField()`: the wiring check knows the real marker field without trusting the storage name. */
+export const retiredFieldMarker: unique symbol = Symbol.for('payload-mcp-publish.retiredField')
 
 type LiveRow = {
   _status?: string
@@ -15,6 +28,13 @@ type Capture = {
   status?: string
 }
 
+type WiringCollection = {
+  fields: Field[]
+  flattenedFields?: FlattenedField[]
+  hooks?: { afterChange?: unknown[] }
+  slug: string
+}
+
 const captureKey = (collection: string, id: number | string) => JSON.stringify([collection, String(id)])
 
 const readLive = async (payload: Payload, collection: CollectionSlug, id: number | string, req?: Partial<PayloadRequest>) =>
@@ -23,14 +43,6 @@ const readLive = async (payload: Payload, collection: CollectionSlug, id: number
     ...(req ? { req } : {}),
     where: { id: { equals: id } },
   })) as LiveRow | null
-
-const requireRetiredField = (payload: Payload, collection: CollectionSlug): void => {
-  const config = payload.collections[collection]?.config
-  const present = config?.flattenedFields.some((field) => 'name' in field && field.name === FIELD)
-  if (!present) {
-    throw new Error(`durableRetirement requires retiredField() in the fields of ${collection}.`)
-  }
-}
 
 /**
  * The hidden checkbox beforeChange hook is half of the durable write: it reads the live row before the update (when the
@@ -54,22 +66,24 @@ const captureLiveBeforeWrite: FieldHook = async ({ collection, context, data, op
  * The document field `durableRetirement` reads. Add it to every collection the lane covers, next to `trackRetirement`.
  * It is hidden and its value is owned by the lane: normal writes cannot set it.
  */
-export const retiredField = (): CheckboxField => ({
-  access: {
-    create: () => false,
-    update: () => false,
-  },
-  defaultValue: false,
-  hidden: true,
-  hooks: { beforeChange: [captureLiveBeforeWrite] },
-  index: true,
-  name: FIELD,
-  type: 'checkbox',
-})
+export const retiredField = (): CheckboxField =>
+  ({
+    access: {
+      create: () => false,
+      update: () => false,
+    },
+    defaultValue: false,
+    hidden: true,
+    hooks: { beforeChange: [captureLiveBeforeWrite] },
+    index: true,
+    name: FIELD,
+    type: 'checkbox',
+    [retiredFieldMarker]: true,
+  }) as CheckboxField
 
 /**
  * `afterChange` for every collection using `durableRetirement`. When a published live row becomes a draft it writes
- * `retired: true` on the live row; when a document is published again it writes `false`. The write goes through the
+ * `retired: true` on the live row; when the owner publishes it again it writes `false`. The write goes through the
  * database adapter inside the same request transaction: it does not create a version, does not re-enter hooks, and is
  * rolled back with the update if a later hook refuses it.
  *
@@ -78,9 +92,8 @@ export const retiredField = (): CheckboxField => ({
  * be too late exactly for the capped histories this guard exists for.
  */
 export const trackRetirement: CollectionAfterChangeHook = async ({ collection, context, doc, operation, req }) => {
-  if (!collection.flattenedFields.some((field) => 'name' in field && field.name === FIELD)) {
-    throw new Error(`trackRetirement requires retiredField() in the fields of ${collection.slug}.`)
-  }
+  const wiring = durableRetirementWiringProblem(collection)
+  if (wiring) throw new Error(wiring)
   if (operation !== 'update') return doc
 
   const id = doc.id as number | string
@@ -93,7 +106,10 @@ export const trackRetirement: CollectionAfterChangeHook = async ({ collection, c
   const before = captures?.[key]
   if (captures && key in captures) delete captures[key]
 
-  const retired = live._status === 'published' ? false : before?.status === 'published' ? true : (before?.retired ?? live.retired) === true
+  const lanePublish = (context as { publishPin?: unknown }).publishPin !== undefined
+  const beforeRetired = (before?.retired ?? live.retired) === true
+  const retired =
+    live._status === 'published' ? (lanePublish ? beforeRetired : false) : before?.status === 'published' ? true : beforeRetired
 
   if ((live.retired === true) !== retired) {
     await req.payload.db.updateOne({
@@ -104,22 +120,64 @@ export const trackRetirement: CollectionAfterChangeHook = async ({ collection, c
       returning: false,
     })
   }
-  return { ...doc, [FIELD]: retired }
+  return doc
+}
+
+/** Why `durableRetirement` cannot protect this collection, or `undefined` when field and hook are both wired. */
+export const durableRetirementWiringProblem = (collection: WiringCollection): string | undefined => {
+  const flattened = collection.flattenedFields ?? flattenAllFields({ cache: true, fields: collection.fields })
+  const field = flattened.some((candidate) => {
+    const marked = candidate as CheckboxField & { [retiredFieldMarker]?: unknown }
+    return marked[retiredFieldMarker] === true && (marked.hooks?.beforeChange ?? []).includes(captureLiveBeforeWrite)
+  })
+  if (!field) {
+    return `durableRetirement requires retiredField() in the fields of ${collection.slug}.`
+  }
+  if (!(collection.hooks?.afterChange ?? []).includes(trackRetirement)) {
+    return `durableRetirement requires trackRetirement in the afterChange hooks of ${collection.slug}.`
+  }
+  return undefined
+}
+
+const requireWiredCollection = (payload: Payload, collection: CollectionSlug): void => {
+  const config = payload.collections[collection]?.config
+  if (!config) throw new Error(`durableRetirement: ${collection} is not a collection of this site.`)
+  const problem = durableRetirementWiringProblem(config)
+  if (problem) throw new Error(problem)
+}
+
+/**
+ * Mark documents that were already retired before durable enforcement, using the same version-history inference the
+ * lane used before the adapter. Only a row that is still unpublished is marked; an owner republish after that write
+ * clears it through `trackRetirement`. Returns the ids it marked.
+ */
+export const backfillRetirement = async (payload: Payload, collection: CollectionSlug): Promise<(number | string)[]> => {
+  requireWiredCollection(payload, collection)
+  const marked: (number | string)[] = []
+  for (const id of await ownerUnpublishedIds(payload, collection)) {
+    const updated = await payload.db.updateOne({
+      collection,
+      data: { [FIELD]: true },
+      where: { and: [{ id: { equals: id } }, { _status: { not_equals: 'published' } }] },
+    })
+    if (updated) marked.push(id)
+  }
+  return marked
 }
 
 /**
  * The durable retirement adapter: the live row's own hidden `retired` marker is the source of truth. It is not inferred
  * from versions, so pruning `versions.maxPerDoc` cannot erase it. Wire `retiredField()` and `trackRetirement` on every
- * collection the lane covers; this adapter refuses with a wiring error when the field is absent.
+ * collection the lane covers; this adapter refuses with a wiring error when either side is absent.
  */
 export const durableRetirement: RetirementAdapter = {
   isRetired: async (payload, collection, id, req) => {
-    requireRetiredField(payload, collection)
+    requireWiredCollection(payload, collection)
     const live = await readLive(payload, collection, id, req)
     return Boolean(live && live._status !== 'published' && live.retired === true)
   },
   retiredIds: async (payload, collection, req) => {
-    requireRetiredField(payload, collection)
+    requireWiredCollection(payload, collection)
     const { docs } = await payload.db.find({
       collection,
       limit: 0,
@@ -129,4 +187,5 @@ export const durableRetirement: RetirementAdapter = {
     })
     return docs.map((doc) => doc.id)
   },
+  wiringProblem: durableRetirementWiringProblem,
 }

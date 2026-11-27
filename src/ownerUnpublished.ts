@@ -1,4 +1,4 @@
-import type { CollectionSlug, Payload, PayloadRequest } from 'payload'
+import type { CollectionConfig, CollectionSlug, Payload, PayloadRequest, SanitizedCollectionConfig } from 'payload'
 import { NotFound } from 'payload'
 
 /**
@@ -22,6 +22,8 @@ export type Standing = 'live' | 'never' | 'retired'
 export type RetirementAdapter = {
   isRetired: (payload: Payload, collection: CollectionSlug, id: number | string, req?: PayloadRequest) => Promise<boolean>
   retiredIds: (payload: Payload, collection: CollectionSlug, req?: PayloadRequest) => Promise<(number | string)[]>
+  /** Why this adapter cannot protect a collection's wiring, or `undefined`. */
+  wiringProblem?: (collection: CollectionConfig | SanitizedCollectionConfig) => string | undefined
 }
 
 type Version = { published: boolean }
@@ -36,12 +38,7 @@ const toVersion = (v: unknown): Version & { parent: number | string } => {
 }
 
 /** The standing of one document. `live` when its live row is published (or it does not exist). */
-export const standingOf = async (
-  payload: Payload,
-  collection: CollectionSlug,
-  id: number | string,
-  req?: PayloadRequest,
-): Promise<Standing> => {
+export const standingOf = async (payload: Payload, collection: CollectionSlug, id: number | string): Promise<Standing> => {
   let live: { _status?: string } | null = null
   try {
     live = (await payload.findByID({
@@ -50,7 +47,6 @@ export const standingOf = async (
       draft: false,
       id,
       overrideAccess: true,
-      ...(req ? { req } : {}),
     })) as unknown as { _status?: string }
   } catch (error) {
     if (!(error instanceof NotFound)) throw error
@@ -64,7 +60,6 @@ export const standingOf = async (
     pagination: false,
     select: SELECT as never,
     where: { parent: { equals: id } },
-    ...(req ? { req } : {}),
   })
   return judge(docs.map(toVersion))
 }
@@ -73,11 +68,7 @@ export const standingOf = async (
  * Ids of the documents of a collection that the owner took down (`retired`, see `Standing`), inferred from version
  * history. One query for the drafts and one for their versions.
  */
-export const ownerUnpublishedIds = async (
-  payload: Payload,
-  collection: CollectionSlug,
-  req?: PayloadRequest,
-): Promise<(number | string)[]> => {
+export const ownerUnpublishedIds = async (payload: Payload, collection: CollectionSlug): Promise<(number | string)[]> => {
   // Same test as `standingOf`: a live row that is not published (a null status included).
   const notLive = await payload.find({
     collection,
@@ -88,7 +79,6 @@ export const ownerUnpublishedIds = async (
     pagination: false,
     select: {},
     where: { _status: { not_equals: 'published' } },
-    ...(req ? { req } : {}),
   })
   if (!notLive.docs.length) return []
   // Only the published versions of those documents: a handful of rows, one `parent` each.
@@ -100,13 +90,12 @@ export const ownerUnpublishedIds = async (
     pagination: false,
     select: { parent: true } as never,
     where: { and: [{ parent: { in: notLive.docs.map((d) => d.id) } }, { 'version._status': { equals: 'published' } }] },
-    ...(req ? { req } : {}),
   })
   return [...new Set(docs.map((v) => (v as unknown as { parent: number | string }).parent))]
 }
 
 /** The pre-adapter guard: version-history inference. Kept as the fallback when a lane has no `retirement` adapter. */
 export const inferredRetirement: RetirementAdapter = {
-  isRetired: async (payload, collection, id, req) => (await standingOf(payload, collection, id, req)) === 'retired',
-  retiredIds: (payload, collection, req) => ownerUnpublishedIds(payload, collection, req),
+  isRetired: async (payload, collection, id) => (await standingOf(payload, collection, id)) === 'retired',
+  retiredIds: (payload, collection) => ownerUnpublishedIds(payload, collection),
 }

@@ -133,24 +133,34 @@ fields: [
 ```
 
 `retiredField()` adds a hidden `retired` checkbox owned by the lane. Normal writes cannot set it. `trackRetirement` sets it
-when a published document becomes unpublished and clears it when the document is published again; the write is inside the
-same transaction, does not create a version, and survives `maxPerDoc` pruning. Generate a migration for the new field.
+when a published document becomes unpublished and clears it only when the owner (not the MCP lane) publishes the document
+again; the write is inside the same transaction, does not create a version, and survives `maxPerDoc` pruning. Generate a
+migration for the new field.
 
-The hook records retirements that happen after it is installed. Backfill documents already retired while their published
-history is still present:
+The hook records retirements that happen after it is installed. Migrate existing retirements in this order:
 
-```ts
-import { ownerUnpublishedIds } from 'payload-mcp-publish'
+1. Deploy `retiredField()` and `trackRetirement` (and the field's migration) while the lane still uses the old inference:
+   do not pass `retirement: durableRetirement` yet.
+2. Run the backfill while the published history is still present:
 
-for (const collection of ['services'] as const) {
-  for (const id of await ownerUnpublishedIds(payload, collection)) {
-    await payload.db.updateOne({ collection, data: { retired: true }, id })
-  }
-}
-```
+   ```ts
+   import { backfillRetirement } from 'payload-mcp-publish'
 
-A document whose published history was already pruned cannot be found this way; mark those ids explicitly or delete them.
-If a collection is missing `retiredField()`, `durableRetirement` fails loudly instead of falling back open.
+   for (const collection of ['services'] as const) {
+     await backfillRetirement(payload, collection)
+   }
+   ```
+
+3. Enable `retirement: durableRetirement` in `mcpPublishLane` and deploy that cutover.
+
+If those cannot be separate rollouts, quiesce all writes and MCP access from before the cutover until the backfill has
+finished, then re-open them. `backfillRetirement` uses the library's own marker definition and marks only rows that are
+still unpublished. A document whose published history was already pruned cannot be found this way; mark those ids
+explicitly or delete them.
+
+`durableRetirement` fails loudly unless the collection has the exact `retiredField()` (recognized by the exported
+`retiredFieldMarker`, not merely the name `retired`) and `trackRetirement` in `afterChange`. A plain checkbox named
+`retired` is not wiring.
 
 A custom adapter is one object and both methods are required; the three guards then share that one source of truth:
 
